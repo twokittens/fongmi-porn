@@ -1,0 +1,94 @@
+{
+  "headers": [
+    {
+      "host": "pix-cdn77.phncdn.com",
+      "header": {
+        "Referer": "https://cn.pornhub.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+      }
+    },
+    {
+      "host": "pix-fl.phncdn.com",
+      "header": {
+        "Referer": "https://cn.pornhub.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+      }
+    },
+    {
+      "host": "cdn1-smallimg.phncdn.com",
+      "header": {
+        "Referer": "https://cn.pornhub.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+      }
+    },
+    {
+      "host": "ei.phncdn.com",
+      "header": {
+        "Referer": "https://cn.pornhub.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+      }
+    },
+    {
+      "host": "es.phncdn.com",
+      "header": {
+        "Referer": "https://cn.pornhub.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+      }
+    },
+    {
+      "host": "bi.phncdn.com",
+      "header": {
+        "Referer": "https://cn.pornhub.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+      }
+    }
+  ],
+  "sites": [
+    {
+      "key": "missav_python_v47",
+      "name": "MissAV",
+      "type": 3,
+      "api": "./missav.py",
+      "searchable": 1,
+      "quickSearch": 1,
+      "filterable": 0,
+      "changeable": 1,
+      "hide": 0,
+      "ext": {}
+    },
+    {
+      "key": "pornhub_python_v16",
+      "name": "Pornhub",
+      "type": 3,
+      "api": "./pornhub_fongmi.py",
+      "searchable": 1,
+      "quickSearch": 1,
+      "filterable": 0,
+      "changeable": 1,
+      "hide": 0,
+      "ext": {}
+    },
+    {
+      "key": "huangguo_fongmi",
+      "name": "黄果短剧",
+      "type": 3,
+      "api": "./huangguo_fongmi.js",
+      "searchable": 1,
+      "quickSearch": 0,
+      "filterable": 0,
+      "changeable": 0
+    },
+     {
+      "key": "missav_verify",
+      "name": "MissAV 人机验证",
+      "type": 3,
+      "api": "./missav_verify.py",
+      "searchable": 0,
+      "quickSearch": 0,
+      "filterable": 0,
+      "changeable": 0,
+      "hide": 0,
+      "ext": {}
+    }
+  ]
+}
