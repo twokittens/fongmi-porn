@@ -35,10 +35,23 @@ def absolute(url):
     return urllib.parse.urljoin(HOST, html.unescape(url or ''))
 
 def get(url):
-    req = urllib.request.Request(absolute(url), headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=18) as resp:
-        charset = resp.headers.get_content_charset() or 'utf-8'
-        return resp.read().decode(charset, errors='replace')
+    """Retry only transient transport/server errors, never access-denied responses."""
+    last = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(absolute(url), headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                charset = resp.headers.get_content_charset() or 'utf-8'
+                return resp.read().decode(charset, errors='replace')
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (408, 429, 500, 502, 503, 504):
+                raise
+            last = exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last = exc
+        if attempt == 0:
+            time.sleep(0.35)
+    raise last
 
 def attrs_dict(attrs):
     return dict(attrs)
@@ -694,16 +707,151 @@ def check_full_hls(url, referer, expected):
     return duration >= max(20, expected * 0.7)
 
 
-def make_play_id(page_url, quality):
-    # Store a stable page URL and quality, never an expiring signed CDN URL.
-    return urllib.parse.quote(json.dumps({'page': page_url, 'quality': quality},
-                                         ensure_ascii=False), safe='')
+def make_play_id(page_url, quality, media_url='', alternatives=None):
+    """Carry the freshly parsed HLS URL into playback; refresh only when stale."""
+    payload = {'page': page_url, 'quality': quality}
+    if media_url:
+        payload['hls'] = media_url
+    if alternatives:
+        payload['alternatives'] = [x for x in alternatives if x != media_url][:5]
+    return urllib.parse.quote(json.dumps(payload, ensure_ascii=False, separators=(',', ':')), safe='')
+
+
+def select_hls(definitions, quality='auto'):
+    """Keep v26's original quality preference without modifying its other features."""
+    if not definitions:
+        return ''
+    target = quality_number(quality) if quality != 'auto' else 0
+    items = list(definitions)
+    if target:
+        items.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
+                                  not d['default']))
+    else:
+        items.sort(key=lambda d: (not d['default'], d['master'],
+                                  abs(d['quality'] - 720) if d['quality'] else 9999))
+    return items[0]['url']
+
+
+def hls_is_fresh(url, margin=90):
+    """Reject expired/near-expiry signed URLs; URLs without expiry are not assumed stale."""
+    if not isinstance(url, str):
+        return False
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != 'https' or not parsed.netloc or not parsed.path.lower().endswith('.m3u8'):
+        return False
+    query = urllib.parse.parse_qs(parsed.query)
+    for key in ('validto', 'expires', 'expire', 'exp'):
+        if key in query:
+            try:
+                deadline = float(query[key][0])
+                if deadline > 1e12:  # milliseconds
+                    deadline /= 1000
+                return deadline > time.time() + margin
+            except (ValueError, TypeError, IndexError):
+                return False
+    return True
+
+def ordered_hls(definitions, quality='auto'):
+    """Return distinct candidate URLs in v26 quality preference order."""
+    target = quality_number(quality) if quality != 'auto' else 0
+    items = list(definitions)
+    if target:
+        items.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
+                                  not d['default']))
+    else:
+        items.sort(key=lambda d: (not d['default'], d['master'],
+                                  abs(d['quality'] - 720) if d['quality'] else 9999))
+    result = []
+    for item in items:
+        if item['url'] not in result:
+            result.append(item['url'])
+    return result
+
+
+def hls_probe(url, referer, requested='auto'):
+    """Validate the actual media playlist and return THAT URL, not its master.
+
+    A master can contain several variants; validating one variant then returning
+    the master lets MPV select a different, broken variant. Avoid that mismatch.
+    """
+    if not hls_is_fresh(url, margin=30):
+        return False, '签名无效或即将过期', ''
+    headers = {'User-Agent': HEADERS['User-Agent'], 'Referer': referer,
+               'Origin': urllib.parse.urlsplit(referer).scheme + '://' + urllib.parse.urlsplit(referer).netloc,
+               'Accept': '*/*'}
+
+    def fetch(target, binary=False):
+        h = dict(headers)
+        if binary:
+            h['Range'] = 'bytes=0-1023'
+        try:
+            with urllib.request.urlopen(urllib.request.Request(target, headers=h), timeout=5) as response:
+                status = getattr(response, 'status', 200)
+                mime = (response.headers.get('Content-Type') or '').lower()
+                raw = response.read(1024 if binary else 512 * 1024)
+            if status not in (200, 206) or 'text/html' in mime or not raw or raw.lstrip().lower().startswith((b'<html', b'<!doctype')):
+                return None, 'HTTP%d/HTML' % status
+            if binary:
+                return raw, 'HTTP%d' % status
+            if not raw.lstrip().startswith(b'#EXTM3U'):
+                return None, '非M3U8'
+            return raw.decode('utf-8-sig', 'replace'), 'HTTP%d' % status
+        except urllib.error.HTTPError as exc:
+            return None, 'HTTP%d' % exc.code
+        except urllib.error.URLError as exc:
+            return None, 'URLError/%s' % type(exc.reason).__name__
+        except (OSError, TimeoutError, ValueError) as exc:
+            return None, type(exc).__name__
+
+    current = url
+    requested_num = quality_number(requested) if requested != 'auto' else 0
+    for depth in range(4):
+        content, status = fetch(current)
+        if content is None:
+            return False, ('主列表' if depth == 0 else '子列表') + ':' + status, ''
+        if '#EXT-X-STREAM-INF' not in content:
+            break
+        variants = playlist_variants(current, content, referer)
+        if not variants:
+            return False, '主列表没有子播放列表', ''
+        preference = requested_num or 720
+        variants.sort(key=lambda item: (abs((item[0] or preference) - preference), -(item[0] or 0)))
+        # Try all child variants if the first child is unreadable; recurse via
+        # the outer candidate list for other top-level HLS sources.
+        current = variants[0][1]
+    else:
+        return False, '播放列表嵌套过深', ''
+
+    if not hls_is_fresh(current, margin=30):
+        return False, '子列表签名即将过期', ''
+    for line in content.splitlines():
+        if line.startswith('#EXT-X-MAP:'):
+            m = re.search(r'URI=["\']([^"\']+)["\']', line)
+            if m:
+                init_url = urllib.parse.urljoin(current, html.unescape(m.group(1)))
+                _, status = fetch(init_url, binary=True)
+                if status not in ('HTTP200', 'HTTP206'):
+                    return False, '初始化分片:' + status, ''
+    segments = []
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not line.startswith('#'):
+            segments.append(urllib.parse.urljoin(current, line))
+            if len(segments) >= 2:
+                break
+    if not segments:
+        return False, '子列表没有视频分片', ''
+    for i, segment in enumerate(segments, 1):
+        _, status = fetch(segment, binary=True)
+        if status not in ('HTTP200', 'HTTP206'):
+            return False, '分片%d:%s' % (i, status), ''
+    return True, '分片可读取', current
 
 class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v25（真实详情信息及播放修复）'
+        return 'Pornhub v26（媒体子列表精准选源）'
 
     def safe_link(self, name, target):
         # FongMi link expects a target dictionary, not a plain string.
@@ -842,8 +990,8 @@ class Spider(BaseSpider):
                 media = media_definitions(source)
             except Exception:
                 media = []
-            urls = ['自动$' + make_play_id(url, 'auto')]
-            urls += [str(q) + 'P$' + make_play_id(url, str(q))
+            urls = ['自动$' + make_play_id(url, 'auto', select_hls(media, 'auto'), ordered_hls(media, 'auto'))]
+            urls += [str(q) + 'P$' + make_play_id(url, str(q), select_hls(media, str(q)), ordered_hls(media, str(q)))
                      for q in sorted(set(d['quality'] for d in media if d['quality'] and not d['master']), reverse=True)]
             if not media:
                 urls.append('网页回退$' + urllib.parse.quote(url, safe=''))
@@ -858,10 +1006,9 @@ class Spider(BaseSpider):
                               'vod_play_from': '实时HLS',
                               'vod_play_url': '自动$' + make_play_id(fallback_url, 'auto')}]} 
     def playerContent(self, flag, id, vipFlags=None):
-        """Refresh signed HLS and verify its manifest before handing it to FongMi."""
+        """Select a verified media playlist; refresh signed URLs only if needed."""
         try:
-            value = urllib.parse.unquote(str(id))
-            data = json.loads(value)
+            data = json.loads(urllib.parse.unquote(str(id)))
             page = str(data.get('page') or '')
             quality = str(data.get('quality') or 'auto').lower().replace('p', '').strip()
             parsed = urllib.parse.urlsplit(page)
@@ -870,24 +1017,49 @@ class Spider(BaseSpider):
                     parsed.path != '/view_video.php' or
                     not urllib.parse.parse_qs(parsed.query).get('viewkey')):
                 return {'parse': 0, 'url': '', 'msg': '无效视频页面'}
-            source = get(page)
-            definitions = media_definitions(source)
-            if not definitions:
-                return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
-            target = quality_number(quality) if quality != 'auto' else 0
-            if target:
-                definitions.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
-                                                 not d['default']))
-            else:
-                definitions.sort(key=lambda d: (not d['default'], d['master'],
-                                                 abs(d['quality'] - 720) if d['quality'] else 9999))
-            # CDN signed URLs are time-sensitive. No preflight GET, which can
-            # consume the validity window before FongMi opens the manifest.
-            media_url = definitions[0]['url']
-            return {'parse': 0, 'url': media_url, 'header': {
-                'User-Agent': HEADERS['User-Agent'],
-                'Referer': page,
-                'Origin': parsed.scheme + '://' + parsed.netloc,
-            }}
+            headers = {'User-Agent': HEADERS['User-Agent'], 'Referer': page,
+                       'Origin': parsed.scheme + '://' + parsed.netloc}
+            initial = data.get('hls') or ''
+            alternatives = data.get('alternatives') or []
+            if not isinstance(alternatives, list):
+                alternatives = []
+            seen = set()
+            reasons = []
+
+            def test_candidates(candidates):
+                # A known-working CDN is only a preference, never a hardcoded replacement.
+                unique = []
+                for candidate in candidates:
+                    if isinstance(candidate, str) and candidate not in seen:
+                        unique.append(candidate)
+                        seen.add(candidate)
+                unique.sort(key=lambda u: 0 if urllib.parse.urlsplit(u).hostname == 'ev-h.phncdn.com' else 1)
+                for candidate in unique[:6]:
+                    if not hls_is_fresh(candidate, margin=45):
+                        reasons.append('签名过期')
+                        continue
+                    ok, reason, playable = hls_probe(candidate, page, quality)
+                    if ok:
+                        return playable
+                    reasons.append(reason)
+                return ''
+
+            # Fast path: one HTML request at detail time; no HTML re-fetch here.
+            playable = test_candidates([initial] + alternatives)
+            if playable:
+                return {'parse': 0, 'url': playable, 'header': headers}
+
+            # Refresh at most twice if the CDN provided unusable signed links.
+            for attempt in range(2):
+                try:
+                    source = get(page)
+                    definitions = media_definitions(source)
+                except Exception as exc:
+                    reasons.append('网页:' + type(exc).__name__)
+                    continue
+                playable = test_candidates(ordered_hls(definitions, quality))
+                if playable:
+                    return {'parse': 0, 'url': playable, 'header': headers}
+            return {'parse': 0, 'url': '', 'msg': 'HLS分片不可访问：' + ', '.join(reasons[-4:])}
         except Exception as exc:
             return {'parse': 0, 'url': '', 'msg': '播放解析失败：' + type(exc).__name__}
