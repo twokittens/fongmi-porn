@@ -694,16 +694,53 @@ def check_full_hls(url, referer, expected):
     return duration >= max(20, expected * 0.7)
 
 
-def make_play_id(page_url, quality):
-    # Store a stable page URL and quality, never an expiring signed CDN URL.
-    return urllib.parse.quote(json.dumps({'page': page_url, 'quality': quality},
-                                         ensure_ascii=False), safe='')
+def make_play_id(page_url, quality, media_url=''):
+    """Carry the freshly parsed HLS URL into playback; refresh only when stale."""
+    payload = {'page': page_url, 'quality': quality}
+    if media_url:
+        payload['hls'] = media_url
+    return urllib.parse.quote(json.dumps(payload, ensure_ascii=False, separators=(',', ':')), safe='')
+
+
+def select_hls(definitions, quality='auto'):
+    """Keep v26's original quality preference without modifying its other features."""
+    if not definitions:
+        return ''
+    target = quality_number(quality) if quality != 'auto' else 0
+    items = list(definitions)
+    if target:
+        items.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
+                                  not d['default']))
+    else:
+        items.sort(key=lambda d: (not d['default'], d['master'],
+                                  abs(d['quality'] - 720) if d['quality'] else 9999))
+    return items[0]['url']
+
+
+def hls_is_fresh(url, margin=90):
+    """Reject expired/near-expiry signed URLs; URLs without expiry are not assumed stale."""
+    if not isinstance(url, str):
+        return False
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != 'https' or not parsed.netloc or not parsed.path.lower().endswith('.m3u8'):
+        return False
+    query = urllib.parse.parse_qs(parsed.query)
+    for key in ('validto', 'expires', 'expire', 'exp'):
+        if key in query:
+            try:
+                deadline = float(query[key][0])
+                if deadline > 1e12:  # milliseconds
+                    deadline /= 1000
+                return deadline > time.time() + margin
+            except (ValueError, TypeError, IndexError):
+                return False
+    return True
 
 class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v25（真实详情信息及播放修复）'
+        return 'Pornhub v26（HLS 单次请求优化）'
 
     def safe_link(self, name, target):
         # FongMi link expects a target dictionary, not a plain string.
@@ -842,8 +879,8 @@ class Spider(BaseSpider):
                 media = media_definitions(source)
             except Exception:
                 media = []
-            urls = ['自动$' + make_play_id(url, 'auto')]
-            urls += [str(q) + 'P$' + make_play_id(url, str(q))
+            urls = ['自动$' + make_play_id(url, 'auto', select_hls(media, 'auto'))]
+            urls += [str(q) + 'P$' + make_play_id(url, str(q), select_hls(media, str(q)))
                      for q in sorted(set(d['quality'] for d in media if d['quality'] and not d['master']), reverse=True)]
             if not media:
                 urls.append('网页回退$' + urllib.parse.quote(url, safe=''))
@@ -858,7 +895,7 @@ class Spider(BaseSpider):
                               'vod_play_from': '实时HLS',
                               'vod_play_url': '自动$' + make_play_id(fallback_url, 'auto')}]} 
     def playerContent(self, flag, id, vipFlags=None):
-        """Refresh signed HLS and verify its manifest before handing it to FongMi."""
+        """Use detail-page HLS directly; re-fetch HTML only if absent or expired."""
         try:
             value = urllib.parse.unquote(str(id))
             data = json.loads(value)
@@ -870,20 +907,14 @@ class Spider(BaseSpider):
                     parsed.path != '/view_video.php' or
                     not urllib.parse.parse_qs(parsed.query).get('viewkey')):
                 return {'parse': 0, 'url': '', 'msg': '无效视频页面'}
-            source = get(page)
-            definitions = media_definitions(source)
-            if not definitions:
-                return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
-            target = quality_number(quality) if quality != 'auto' else 0
-            if target:
-                definitions.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
-                                                 not d['default']))
-            else:
-                definitions.sort(key=lambda d: (not d['default'], d['master'],
-                                                 abs(d['quality'] - 720) if d['quality'] else 9999))
-            # CDN signed URLs are time-sensitive. No preflight GET, which can
-            # consume the validity window before FongMi opens the manifest.
-            media_url = definitions[0]['url']
+
+            media_url = str(data.get('hls') or '')
+            if not hls_is_fresh(media_url):
+                source = get(page)
+                media_url = select_hls(media_definitions(source), quality)
+                if not media_url:
+                    return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
+
             return {'parse': 0, 'url': media_url, 'header': {
                 'User-Agent': HEADERS['User-Agent'],
                 'Referer': page,
