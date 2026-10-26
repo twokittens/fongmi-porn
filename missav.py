@@ -149,6 +149,59 @@ def parse_directory(source, kind):
     return result
 
 
+def parse_search_actresses(source):
+    """Only include actress links actually present in the returned search HTML."""
+    class ActressLinks(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.active = []
+            self.records = []
+
+        def handle_starttag(self, tag, attrs):
+            a = dict(attrs)
+            if tag == 'a':
+                href = a.get('href', '')
+                path = urlsplit(absolute(href)).path.rstrip('/')
+                ok = bool(re.fullmatch(r'(?:/dm\d+)?/cn/actresses/[^/]+', path, re.I))
+                self.active.append({'href': href, 'name': a.get('title', ''),
+                                    'pic': '', 'text': [], 'ok': ok})
+            elif tag == 'img' and self.active and self.active[-1]['ok']:
+                card = self.active[-1]
+                card['name'] = card['name'] or a.get('alt', '')
+                for key in ('data-src', 'data-original', 'data-lazy-src', 'src'):
+                    pic = a.get(key, '')
+                    if pic and not pic.startswith(('data:', 'blob:')):
+                        card['pic'] = absolute(pic)
+                        break
+
+        def handle_data(self, data):
+            if self.active:
+                self.active[-1]['text'].append(data)
+
+        def handle_endtag(self, tag):
+            if tag == 'a' and self.active:
+                card = self.active.pop()
+                if card['ok']:
+                    self.records.append(card)
+
+    parser = ActressLinks()
+    parser.feed(source)
+    result, seen = [], set()
+    for card in parser.records:
+        url = absolute(card['href'])
+        if url in seen:
+            continue
+        seen.add(url)
+        name = re.sub(r'\s+', ' ', html.unescape(card['name'] or ''.join(card['text']))).strip()
+        if not name:
+            name = unquote(urlsplit(url).path.rstrip('/').split('/')[-1]).replace('-', ' ')
+        result.append({'vod_id': url, 'vod_name': name,
+                       'vod_pic': card['pic'], 'vod_remarks': name,
+                       'vod_tag': 'folder', 'cate': {},
+                       'style': {'type': 'oval', 'ratio': 1.0}})
+    return result
+
+
 def filter_choices(options):
     return [{'n': '全部', 'v': ''}] + [{'n': n, 'v': v} for n, v in options]
 
@@ -666,6 +719,7 @@ class Spider(BaseSpider):
         batch_size = 3
         first_site_page = (client_page - 1) * batch_size + 1
         items, seen = [], set()
+        actresses, seen_actresses = [], set()
         completed_batch = False
         for site_page in range(first_site_page, first_site_page + batch_size):
             url = absolute(target)
@@ -676,8 +730,13 @@ class Spider(BaseSpider):
                 break
             try:
                 page_items, _ = parse_videos(body)
+                page_actresses = parse_search_actresses(body)
             except Exception:
                 break
+            for actress in page_actresses:
+                if actress['vod_id'] not in seen_actresses:
+                    seen_actresses.add(actress['vod_id'])
+                    actresses.append(actress)
             fresh = 0
             for item in page_items:
                 if item['vod_id'] not in seen:
@@ -688,9 +747,12 @@ class Spider(BaseSpider):
                 break
             if site_page == first_site_page + batch_size - 1:
                 completed_batch = True
-        n = len(items)
-        return {'list': items, 'page': client_page,
-                'pagecount': client_page + 1 if n and completed_batch else client_page,
+        # Put clickable actress portraits ahead of landscape video cards.
+        # Keep search-page pagination driven by videos, not by repeated portraits.
+        results = actresses + items
+        n = len(results)
+        return {'list': results, 'page': client_page,
+                'pagecount': client_page + 1 if items and completed_batch else client_page,
                 'limit': n or 20,
                 'total': (client_page + 1) * n if n else client_page * 20}
 
