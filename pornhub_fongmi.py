@@ -403,42 +403,57 @@ class VideoLinksParser(HTMLParser):
                     self.links.append(item)
 
 
-def detail_links(source):
-    parser = VideoLinksParser()
-    parser.feed(source)
-    performers, tags = [], []
-    seen = set()
-    for item in parser.links:
-        url = absolute(item['href'])
+def _section(source, marker, end_marker=None, limit=18000):
+    pos = source.find(marker)
+    if pos < 0:
+        return ''
+    end = source.find(end_marker, pos + len(marker)) if end_marker else -1
+    return source[pos:end if end > pos else pos + limit]
+
+
+def _anchors(fragment, accepted=None):
+    result, seen = [], set()
+    for m in re.finditer(r'<a\b([^>]*)>(.*?)</a\s*>', fragment, re.I | re.S):
+        attrs = dict((k.lower(), html.unescape(v)) for k, v in
+                     re.findall(r'([\w-]+)\s*=\s*["\']([^"\']*)["\']', m.group(1)))
+        href = attrs.get('href', '')
+        if not href or href.startswith(('#', 'javascript:')):
+            continue
+        url = absolute(href)
         parsed = urllib.parse.urlsplit(url)
-        if parsed.netloc not in ('pornhub.com', 'www.pornhub.com', 'cn.pornhub.com'):
+        if parsed.hostname not in ('pornhub.com', 'www.pornhub.com', 'cn.pornhub.com'):
             continue
-        path = parsed.path.rstrip('/')
-        name = item['name']
-        if not name or (url in seen):
+        if accepted and not accepted(parsed.path):
             continue
-        if re.fullmatch(r'/(?:pornstar|model)/[^/]+', path, re.I):
-            performers.append((name, url))
-        elif re.fullmatch(r'/(?:categories|category|video/categories|video/category|tags|tag)/[^/]+', path, re.I):
-            tags.append((name, url))
-        seen.add(url)
-    return performers[:25], tags[:40]
+        name = clean(m.group(2)) or clean(attrs.get('title'))
+        if name and url not in seen:
+            seen.add(url)
+            result.append((name, url))
+    return result
+
+
+def detail_links(source):
+    # Only the main video metadata block. Do not pick unrelated authors
+    # and tags from recommendation cards or navigation menus.
+    about = _section(source, 'video-detailed-info', 'video-action-tab', 13000)
+    uploader = _section(about, 'userInfoBlock', 'video-info-row js-suggestionsRow', 4500)
+    performers = _anchors(uploader, lambda p: bool(re.fullmatch(r'/(?:pornstar|model|users)/[^/]+', p, re.I)))
+    categories = _anchors(_section(about, 'categoriesWrapper', 'tagsWrapper', 3500),
+                          lambda p: p.startswith(('/categories/', '/video', '/hd', '/tags/')))
+    tags = _anchors(_section(about, 'tagsWrapper', 'video-info-row', 4500),
+                    lambda p: p.startswith(('/video/search', '/tags/', '/tag/')))
+    return performers[:8], tags[:35], categories[:30]
 
 
 def related_cards(source, current_url=''):
-    """Prefer a dedicated related/recommended video section over generic page cards."""
-    sections = re.findall(
-        r'<(?:ul|div|section)\b[^>]*(?:id|class)=["\'][^"\']*'
-        r'(?:relatedVideos|related-videos|recommendedVideos|recommended-videos|relatedVideoSection)'
-        r'[^"\']*["\'][^>]*>', source, re.I)
-    # Some layouts do not wrap related cards in a named section.
-    cards = parse_cards(source) if not sections else []
-    if sections:
-        start = source.find(sections[0])
-        cards = parse_cards(source[start:]) if start >= 0 else []
+    # The supplied page uses ul#relatedVideosListing; keep only this grid.
+    section = _section(source, 'id="relatedVideosListing"', '</ul>', 150000)
+    if not section:
+        section = _section(source, 'id=\'relatedVideosListing\'', '</ul>', 150000)
+    cards = parse_cards(section) if section else []
     current_key = urllib.parse.parse_qs(urllib.parse.urlsplit(current_url).query).get('viewkey', [''])[0]
     return [c for c in cards if urllib.parse.parse_qs(
-        urllib.parse.urlsplit(c['vod_id']).query).get('viewkey', [''])[0] != current_key][:60]
+        urllib.parse.urlsplit(c['vod_id']).query).get('viewkey', [''])[0] != current_key][:80]
 
 
 def search_performer_pages(keyword):
@@ -676,7 +691,7 @@ class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v24（详情页修复）'
+        return 'Pornhub v25（真实详情信息及播放修复）'
 
     def safe_link(self, name, target):
         # FongMi link expects a target dictionary, not a plain string.
@@ -796,13 +811,15 @@ class Spider(BaseSpider):
             pic = absolute(pic) if pic else ''
             desc = clean(ld.get('description')) or match_meta(source, 'og:description')
             try:
-                performers, tags = detail_links(source)
+                performers, tags, categories = detail_links(source)
             except Exception:
-                performers, tags = [], []
+                performers, tags, categories = [], [], []
             lines = []
             if performers:
                 lines.append('作者：' + '、'.join(self.safe_link(name, 'pornstar:' + link)
                                               for name, link in performers))
+            if categories:
+                lines.append('分类：' + '、'.join(self.safe_link(name, link) for name, link in categories))
             if tags:
                 lines.append('标签：' + '、'.join(self.safe_link(name, link) for name, link in tags))
             lines.append('相关视频：' + self.safe_link('查看相关视频 ›', 'related:' + url))
@@ -842,9 +859,19 @@ class Spider(BaseSpider):
                     not urllib.parse.parse_qs(parsed.query).get('viewkey')):
                 return {'parse': 0, 'url': '', 'msg': '无效视频页面'}
             source = get(page)
-            media_url, error = choose_stream(source, page, quality)
-            if not media_url:
-                return {'parse': 0, 'url': '', 'msg': error}
+            definitions = media_definitions(source)
+            if not definitions:
+                return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
+            target = quality_number(quality) if quality != 'auto' else 0
+            if target:
+                definitions.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
+                                                 not d['default']))
+            else:
+                definitions.sort(key=lambda d: (not d['default'], d['master'],
+                                                 abs(d['quality'] - 720) if d['quality'] else 9999))
+            # CDN signed URLs are time-sensitive. No preflight GET, which can
+            # consume the validity window before FongMi opens the manifest.
+            media_url = definitions[0]['url']
             return {'parse': 0, 'url': media_url, 'header': {
                 'User-Agent': HEADERS['User-Agent'],
                 'Referer': page,
