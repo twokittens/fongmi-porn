@@ -327,6 +327,27 @@ class PageParser(HTMLParser):
             self.cards.append(self.stack.pop())
 
 
+def parse_detail_actresses(source):
+    """Read only actual actress anchors from the video metadata, not navigation."""
+    result, seen = [], set()
+    pattern = (r'<a\b[^>]*href\s*=\s*([\"\'])([^\"\']+)\1[^>]*>'
+               r'(.*?)</a\s*>')
+    for match in re.finditer(pattern, source, re.I | re.S):
+        url = absolute(match.group(2))
+        path = urlsplit(url).path.rstrip('/')
+        if not re.fullmatch(r'(?:/dm\d+)?/cn/actresses/[^/]+', path, re.I):
+            continue
+        if path.lower().endswith('/ranking') or url in seen:
+            continue
+        name = re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', match.group(3)))).strip()
+        if not name:
+            name = unquote(path.split('/')[-1]).replace('-', ' ')
+        if name:
+            seen.add(url)
+            result.append((name, url))
+    return result
+
+
 def parse_videos(source):
     parser = PageParser()
     parser.feed(source)
@@ -351,86 +372,6 @@ def parse_videos(source):
                        'vod_remarks': code.upper(),
                        'style': {'type': 'rect', 'ratio': 1.78}})
     return result, parser
-
-
-def extract_detail_recommendations(source, current_url='', limit=30):
-    """Read only actual rendered recommendation anchors, not JS templates or guesses.
-
-    The fragment after # is a Recombee tracking token; strip it from the video URL.
-    """
-    from html.parser import HTMLParser
-
-    class RecommendationParser(HTMLParser):
-        def __init__(self):
-            super().__init__(convert_charrefs=True)
-            self.links = []
-            self.active = []
-
-        def handle_starttag(self, tag, attrs):
-            a = dict(attrs)
-            if tag == 'a':
-                href = html.unescape(a.get('href', ''))
-                fragment = urlsplit(href).fragment.lower()
-                # Only recommendations identified by the site's tracking fragment.
-                eligible = any(marker in fragment for marker in (
-                    'watch-next-side', 'watch-next-bottom', 'mobile-watch-next'))
-                self.active.append({'url': href.split('#', 1)[0],
-                                    'eligible': eligible, 'text': [],
-                                    'title': a.get('title', '')})
-            elif tag == 'img' and self.active and self.active[-1]['eligible']:
-                self.active[-1]['title'] = (self.active[-1]['title'] or
-                    a.get('alt', ''))
-
-        def handle_data(self, data):
-            if self.active:
-                self.active[-1]['text'].append(data)
-
-        def handle_endtag(self, tag):
-            if tag == 'a' and self.active:
-                item = self.active.pop()
-                if item['eligible']:
-                    self.links.append(item)
-
-    parser = RecommendationParser()
-    parser.feed(source)
-    found, seen = [], set()
-    current = absolute(current_url).split('#', 1)[0]
-    for item in parser.links:
-        url = absolute(item['url'])
-        if not valid_video(url) or url == current or url in seen:
-            continue
-        seen.add(url)
-        title = re.sub(r'\s+', ' ', item['title'] or ' '.join(item['text'])).strip()
-        if not title:
-            title = unquote(urlsplit(url).path.rstrip('/').split('/')[-1]).upper()
-        found.append({'url': url, 'title': title[:100]})
-        if len(found) >= limit:
-            break
-    return found
-
-
-def extract_detail_actresses(source):
-    """Extract actual actress profile links from the current detail HTML."""
-    matches, seen = [], set()
-    pattern = (r'<a\b(?P<attrs>[^>]*?)\bhref\s*=\s*'
-               r'(?P<q>[\x22\x27])(?P<href>.*?)(?P=q)'
-               r'[^>]*>(?P<body>.*?)</a\s*>')
-    for m in re.finditer(pattern, source, re.I | re.S):
-        url = absolute(m.group('href'))
-        if not re.fullmatch(r'(?:/dm\d+)?/cn/actresses/[^/]+',
-                            urlsplit(url).path.rstrip('/'), re.I):
-            continue
-        if url in seen or urlsplit(url).path.rstrip('/').endswith('/ranking'):
-            continue
-        seen.add(url)
-        body = m.group('body')
-        label = re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]*>', ' ', body))).strip()
-        img = re.search(r'<img\b[^>]*\balt=[\x22\x27]([^\x22\x27]+)', body, re.I)
-        name = label or (html.unescape(img.group(1)) if img else '')
-        if not name:
-            name = unquote(urlsplit(url).path.rstrip('/').split('/')[-1]).replace('-', ' ')
-        matches.append({'name': name[:80], 'url': url})
-    return matches
 
 
 def unpack_player(source):
@@ -879,6 +820,14 @@ class Spider(BaseSpider):
         name = (' '.join(parser.title_text).strip() or
                 parser.meta.get('og:title') or vid.rsplit('/', 1)[-1])
         code, _ = version_info(vid)
+        actresses = parse_detail_actresses(source)
+        actress_links = []
+        for actress_name, actress_url in actresses:
+            target = {'id': actress_url, 'name': actress_name, 'type_flag': 1}
+            try:
+                actress_links.append(self.link(actress_name, target))
+            except Exception:
+                actress_links.append(actress_name)
         # Discover real same-code variants via the verified /cn/search/<code> page.
         # Do not guess /dmNN/ paths: they can differ between versions.
         candidates = [vid]
@@ -934,33 +883,13 @@ class Spider(BaseSpider):
             if entries:
                 groups.append((label, '#'.join(entries)))
                 seen_versions.add(label)
-        # Only real recommendation anchors already present in this response.
-        # In many MissAV pages Recombee populates them later via JavaScript;
-        # those items cannot be inferred from a static HTML response.
-        related = extract_detail_recommendations(source, vid)
-        if related:
-            related_entries = []
-            for item in related:
-                safe_title = re.sub(r'[$#]', ' ', item['title'])
-                related_entries.append('{}$missavpage:{}'.format(
-                    safe_title, quote(item['url'], safe='')))
-            groups.append(('网页相关推荐', '#'.join(related_entries)))
-        actresses = extract_detail_actresses(source)
-        actress_names = '、'.join(a['name'] for a in actresses)
-        actress_links = '\n'.join('{}：{}'.format(a['name'], a['url'])
-                                   for a in actresses)
-        content = parser.meta.get('description', '')
-        if actress_links:
-            content += '\n关联女优作品页：\n' + actress_links
-        if not related:
-            content += '\n相关推荐：网页源码未包含实际推荐条目（可能由 JavaScript 异步加载）。'
-        content += ('\n可选版本：' + '、'.join(label for label, _ in groups)
-                    if groups else '\n没有解析出有效播放线路')
         return {'list': [{
             'vod_id': vid, 'vod_name': name,
             'vod_pic': absolute(parser.meta.get('og:image')) if parser.meta.get('og:image') else '',
-            'vod_actor': actress_names,
-            'vod_content': content,
+            'vod_actor': '、'.join(actress_links),
+            'vod_content': parser.meta.get('description', '') +
+                           ('\n可选版本：' + '、'.join(label for label, _ in groups)
+                            if groups else '\n没有解析出有效播放线路'),
             'vod_play_from': '$$$'.join(label for label, _ in groups),
             'vod_play_url': '$$$'.join(items for _, items in groups)
         }]}
