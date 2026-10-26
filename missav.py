@@ -1187,20 +1187,29 @@ class Spider(BaseSpider):
             if entries:
                 groups.append((label, '#'.join(entries)))
                 seen_versions.add(label)
+        # Keep only requested metadata, one line per field, no blank lines.
+        metadata_rows = [
+            '发行日期：' + release_date if release_date else '',
+            '番号：' + code.upper() if code else '',
+            '标题：' + name if name else '',
+            '女优：' + '、'.join(actress_links) if actress_links else '',
+        ]
+        metadata_rows.extend(extra_rows)
+        if director_links:
+            metadata_rows.append('导演：' + '、'.join(director_links))
+        metadata_rows.append(recommend_link)
         return {'list': [{
-            'vod_id': vid, 'vod_name': name,
+            'vod_id': vid,
+            'vod_name': name,
             'vod_pic': absolute(parser.meta.get('og:image')) if parser.meta.get('og:image') else '',
-            # FongMi renders the actor field under its built-in '演员' label;
-            # the Spider API cannot rename that native label to '女优'.
-            'vod_actor': '\n\n'.join(filter(None, ['、'.join(actress_links)] + extra_rows)),
-            # Keep director clickable; put recommendations on the next row,
-            # outside the actress/metadata block and away from playback lines.
-            'vod_director': '\n\n'.join(filter(None, ['、'.join(director_links), recommend_link])),
-            'vod_pubdate': release_date,
-            'vod_year': release_date[:4] if release_date else '',
-            'vod_content': parser.meta.get('description', '') +
-                           ('\n可选版本：' + '、'.join(label for label, _ in groups)
-                            if groups else '\n没有解析出有效播放线路'),
+            # FongMi's built-in field captions cannot be renamed by a Spider.
+            # Put all custom metadata into one visible field, with single newlines.
+            'vod_actor': '\n'.join(filter(None, metadata_rows)),
+            'vod_director': '',
+            'vod_area': '',
+            'vod_year': '',
+            'vod_pubdate': '',
+            'vod_content': '',
             'vod_play_from': '$$$'.join(label for label, _ in groups),
             'vod_play_url': '$$$'.join(items for _, items in groups)
         }]}
