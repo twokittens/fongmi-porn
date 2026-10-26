@@ -676,7 +676,17 @@ class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v23（播放兼容修复）'
+        return 'Pornhub v24（详情页修复）'
+
+    def safe_link(self, name, target):
+        # FongMi link expects a target dictionary, not a plain string.
+        # Never allow link rendering errors to blank the entire detail page.
+        payload = {'id': target, 'name': name, 'type_flag': 1}
+        try:
+            return self.link(name, payload)
+        except Exception:
+            return name
+
     def isVideoFormat(self, url):
         return bool(re.search(r'\.(?:mp4|m3u8)(?:[?#]|$)', str(url), re.I))
     def manualVideoCheck(self):
@@ -785,28 +795,39 @@ class Spider(BaseSpider):
                 pic = pic[0] if pic else ''
             pic = absolute(pic) if pic else ''
             desc = clean(ld.get('description')) or match_meta(source, 'og:description')
-            performers, tags = detail_links(source)
+            try:
+                performers, tags = detail_links(source)
+            except Exception:
+                performers, tags = [], []
             lines = []
             if performers:
-                lines.append('作者：' + '、'.join(self.link(name, 'pornstar:' + link)
+                lines.append('作者：' + '、'.join(self.safe_link(name, 'pornstar:' + link)
                                               for name, link in performers))
             if tags:
-                lines.append('标签：' + '、'.join(self.link(name, link) for name, link in tags))
-            lines.append('相关视频：' + self.link('查看相关视频 ›', 'related:' + url))
+                lines.append('标签：' + '、'.join(self.safe_link(name, link) for name, link in tags))
+            lines.append('相关视频：' + self.safe_link('查看相关视频 ›', 'related:' + url))
             if desc:
                 lines.append('简介：' + desc)
             desc = '\n'.join(lines)
-            media = media_definitions(source)
+            try:
+                media = media_definitions(source)
+            except Exception:
+                media = []
             urls = ['自动$' + make_play_id(url, 'auto')]
             urls += [str(q) + 'P$' + make_play_id(url, str(q))
                      for q in sorted(set(d['quality'] for d in media if d['quality'] and not d['master']), reverse=True)]
-            if not urls:
-                urls = ['网页地址$' + urllib.parse.quote(url, safe='')]
+            if not media:
+                urls.append('网页回退$' + urllib.parse.quote(url, safe=''))
             return {'list': [{'vod_id': url, 'vod_name': title, 'vod_pic': pic,
                               'vod_content': desc, 'vod_play_from': '实时HLS' if media else '网页回退',
                               'vod_play_url': '#'.join(urls)}]}
-        except Exception:
-            return {'list': []}
+        except Exception as exc:
+            # A broken metadata parser must not prevent opening a video page.
+            fallback_url = absolute(ids[0])
+            return {'list': [{'vod_id': fallback_url, 'vod_name': '视频详情',
+                              'vod_content': '详情信息部分解析失败：' + type(exc).__name__,
+                              'vod_play_from': '实时HLS',
+                              'vod_play_url': '自动$' + make_play_id(fallback_url, 'auto')}]} 
     def playerContent(self, flag, id, vipFlags=None):
         """Refresh signed HLS and verify its manifest before handing it to FongMi."""
         try:
