@@ -20,7 +20,8 @@ HEADERS = {
     'Referer': HOST + '/',
 }
 CATEGORIES = [
-    {'type_name': '色情明星', 'type_id': 'pornstars'},
+    {'type_name': '最受欢迎色情明星', 'type_id': 'pornstars'},
+    {'type_name': '最热门色情明星', 'type_id': 'pornstars_hot'},
     {'type_name': '最新视频', 'type_id': '/video?o=cm'},
     {'type_name': '热门视频', 'type_id': '/video?o=ht'},
     {'type_name': '最多观看', 'type_id': '/video?o=mv'},
@@ -102,7 +103,7 @@ class CardParser(HTMLParser):
         d = dict(attrs)
         if tag == 'li':
             if self.current is None:
-                self.current = {'href': '', 'title': '', 'image': '', 'text': []}
+                self.current = {'href': '', 'title': '', 'image': '', 'text': [], 'duration': '', 'duration_capture': False}
                 self.li_depth = 1
             else:
                 self.li_depth += 1
@@ -114,6 +115,8 @@ class CardParser(HTMLParser):
                 self.current['href'] = self.current['href'] or href
                 self.current['title'] = self.current['title'] or d.get('title', '')
                 self.anchor = True
+        elif tag in ('var', 'span') and 'duration' in (d.get('class') or '').split():
+            self.current['duration_capture'] = True
         elif tag == 'img':
             pic = pick_thumbnail(d)
             if pic and not self.current['image']:
@@ -121,10 +124,16 @@ class CardParser(HTMLParser):
             self.current['title'] = self.current['title'] or d.get('alt', '')
 
     def handle_data(self, data):
+        if self.current is not None and self.current.get('duration_capture'):
+            candidate = data.strip()
+            if re.fullmatch(r'\d{1,3}:\d{2}(?::\d{2})?', candidate):
+                self.current['duration'] = candidate
         if self.current is not None and self.anchor:
             self.current['text'].append(data)
 
     def handle_endtag(self, tag):
+        if tag in ('var', 'span') and self.current is not None:
+            self.current['duration_capture'] = False
         if tag == 'a':
             self.anchor = None
         if tag == 'li' and self.current is not None:
@@ -146,7 +155,7 @@ def parse_cards(source):
         title = clean(card['title']) or clean(' '.join(card['text'])) or key
         seen.add(key)
         result.append({'vod_id': url, 'vod_name': title,
-                       'vod_pic': card['image'], 'vod_remarks': '',
+                       'vod_pic': card['image'], 'vod_remarks': card.get('duration', ''),
                        'style': {'type': 'rect', 'ratio': 1.78}})
     return result
 
@@ -280,8 +289,24 @@ class PornstarParser(HTMLParser):
 def parse_pornstars(source):
     parser = PornstarParser()
     parser.feed(source)
+    entries = parser.items
+    if not entries:
+        # Newer directory pages use performerCard without ul#popularPornstars.
+        # Only parse the page's main content, excluding navigation menus.
+        main = re.search(r'<(?:main|div)\b[^>]*(?:id=["\'](?:content|pornstars|mainContent)["\']|class=["\'][^"\']*(?:mainContent|pornstarsList|pornstarsContainer)[^"\']*["\'])[^>]*>', source, re.I)
+        scope = source[main.start():] if main else source
+        entries = []
+        for match in re.finditer(r'<li\b[^>]*class=["\'][^"\']*\bperformerCard\b[^"\']*["\'][^>]*>(.*?)</li\s*>', scope, re.I | re.S):
+            block = match.group(1)
+            link = re.search(r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>', block, re.I)
+            if not link or not re.fullmatch(r'/(?:pornstar|model)/[^/]+', urllib.parse.urlsplit(absolute(link.group(1))).path.rstrip('/'), re.I):
+                continue
+            img = re.search(r'<img\b([^>]*)>', block, re.I | re.S)
+            attrs = dict(re.findall(r'([\w-]+)\s*=\s*["\']([^"\']*)["\']', img.group(1))) if img else {}
+            heading = re.search(r'<(?:span|a)\b[^>]*class=["\'][^"\']*(?:performerName|performerCardName)[^"\']*["\'][^>]*>(.*?)</(?:span|a)>', block, re.I | re.S)
+            entries.append({'href': link.group(1), 'name': clean(heading.group(1)) if heading else (attrs.get('alt') or ''), 'image': pick_performer_image(attrs), 'rank': ''})
     result, seen = [], set()
-    for item in parser.items:
+    for item in entries:
         url = absolute(item['href'])
         if url in seen:
             continue
@@ -307,7 +332,7 @@ class SearchPerformerParser(HTMLParser):
             href = a.get('href', '')
             path = urllib.parse.urlsplit(absolute(href)).path.rstrip('/')
             if re.fullmatch(r'/(?:pornstar|model)/[^/]+', path, re.I):
-                self.links.append({'url': absolute(href), 'name': a.get('title', ''),
+                self.links.append({'url': absolute(href), 'name': a.get('title', '') or a.get('alt', ''),
                                    'image': '', 'text': [], 'depth': 1})
             elif self.links:
                 self.links[-1]['depth'] += 1
@@ -506,8 +531,15 @@ class Spider(BaseSpider):
     def categoryContent(self, tid, pg, filter=False, extend=None):
         try:
             pg = max(1, int(pg))
-            if tid == 'pornstars':
-                path = '/pornstars' + ('?page=' + str(pg) if pg > 1 else '')
+            if tid in ('pornstars', 'pornstars_hot'):
+                path = '/pornstars'
+                params = []
+                if tid == 'pornstars_hot':
+                    params.append(('o', 't'))
+                if pg > 1:
+                    params.append(('page', str(pg)))
+                if params:
+                    path += '?' + urllib.parse.urlencode(params)
                 stars = parse_pornstars(get(path))
                 return {'list': stars, 'page': pg,
                         'pagecount': pg + 1 if stars else pg,
@@ -604,31 +636,33 @@ class Spider(BaseSpider):
         except Exception:
             return {'list': []}
     def playerContent(self, flag, id, vipFlags=None):
+        """Refresh signed HLS once at play time; avoid slow recursive manifest scans.
+
+        A 410 can still happen after handoff if the CDN invalidates the URL.
+        """
         value = urllib.parse.unquote(str(id))
         try:
             data = json.loads(value)
-            page = data.get('page', '')
-            quality = str(data.get('quality', '')).replace('P', '').strip()
-            if not page or 'view_video.php' not in page:
-                return {'parse': 1, 'url': page or value}
+            page = str(data.get('page') or '')
+            quality = str(data.get('quality') or '').upper().replace('P', '').strip()
+            if not page.startswith(HOST + '/view_video.php'):
+                return {'parse': 0, 'url': '', 'msg': '无效视频页面'}
             source = get(page)
-            expected = expected_video_duration(source)
             choices = media_definitions(source)
-            # Never silently switch quality or use a preview/advertisement MP4.
             if quality.isdigit():
                 choices = [(q, u) for q, u in choices if q == quality]
             else:
                 choices.sort(key=lambda x: int(x[0]), reverse=True)
-            for q, media_url in choices:
-                if check_full_hls(media_url, page, expected):
-                    return {'parse': 0, 'url': media_url, 'header': {
-                        'User-Agent': HEADERS['User-Agent'],
-                        'Referer': page,
-                        'Origin': urllib.parse.urlsplit(page).scheme + '://' + urllib.parse.urlsplit(page).netloc,
-                    }}
-            # No verified full stream: return webpage rather than a wrong short clip.
-            return {'parse': 1, 'url': page}
-        except (ValueError, TypeError):
-            return {'parse': 1, 'url': value}
+            if not choices:
+                return {'parse': 0, 'url': '', 'msg': '未找到对应清晰度的HLS正片地址'}
+            # HLS is taken exclusively from the player mediaDefinitions, never ad fields.
+            # Skip fetching the entire HLS tree here: it can consume a signed URL's TTL.
+            # The player fetches the playlist itself, using the same headers.
+            media_url = choices[0][1]
+            return {'parse': 0, 'url': media_url, 'header': {
+                'User-Agent': HEADERS['User-Agent'],
+                'Referer': page,
+                'Origin': HOST,
+            }}
         except Exception:
-            return {'parse': 1, 'url': value if value.startswith('http') else HOST + '/'}
+            return {'parse': 0, 'url': '', 'msg': '解析失败，请退出重进以刷新播放地址'}
