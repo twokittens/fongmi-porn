@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""MissAV FongMi Python Spider v1.4.3 (actress labels restored, shared native filters, directory labels, subtitles)."""
+"""MissAV FongMi Python Spider v1.5.9 (clickable video metadata categories)."""
 import re
 import html
 import json
@@ -473,6 +473,52 @@ class PageParser(HTMLParser):
             self.cards.append(self.stack.pop())
 
 
+
+
+def parse_detail_directors(source):
+    """Extract real director links from detail HTML; never invent a director."""
+    result, seen = [], set()
+    anchor = (r'<a\b[^>]*href\s*=\s*(["\'])([^"\']+)\1[^>]*>'
+              r'(.*?)</a\s*>')
+    for match in re.finditer(anchor, source, re.I | re.S):
+        url = absolute(html.unescape(match.group(2)))
+        path = urlsplit(url).path.rstrip('/')
+        if not re.fullmatch(r'(?:/dm\d+)?/cn/(?:directors|director)/[^/]+', path, re.I):
+            continue
+        if url in seen:
+            continue
+        name = re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', match.group(3)))).strip()
+        if name:
+            result.append((name, url))
+            seen.add(url)
+    return result
+
+
+def parse_detail_entities(source):
+    """Read actual linked metadata from the video information block."""
+    types = ('actresses', 'genres', 'series', 'makers', 'labels', 'directors', 'director')
+    result = {key: [] for key in types}
+    seen = {key: set() for key in types}
+    # The video metadata uses text-secondary rows with one metadata label.
+    for row in re.finditer(r'<div\b[^>]*class=["\'][^"\']*text-secondary[^"\']*["\'][^>]*>(.*?)</div\s*>', source, re.I | re.S):
+        content = row.group(1)
+        if not re.search(r'<span[^>]*>\s*(?:女优|類型|类型|系列|发行商|發行商|标籤|標籤|导演|導演)\s*:', content, re.I):
+            continue
+        for match in re.finditer(r'<a\b[^>]*href\s*=\s*(["\'])(.*?)\1[^>]*>(.*?)</a\s*>', content, re.I | re.S):
+            url = absolute(html.unescape(match.group(2)))
+            path = urlsplit(url).path.rstrip('/')
+            found = re.fullmatch(r'(?:/dm\d+)?/cn/(actresses|genres|series|makers|labels|directors|director)/[^/]+', path, re.I)
+            if not found:
+                continue
+            kind = found.group(1).lower()
+            if url in seen[kind]:
+                continue
+            name = re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', match.group(3)))).strip()
+            if name:
+                seen[kind].add(url)
+                result[kind].append((name, url))
+    return result
+
 def parse_detail_actresses(source):
     """Read only actual actress anchors from the video metadata, not navigation."""
     result, seen = [], set()
@@ -836,8 +882,6 @@ class Spider(BaseSpider):
         return {'list': []}
 
     def _recombee_recommendations(self, code, video_url):
-        # Recombee accepts a per-user UUID. A fresh ID avoids reusing the
-        # browser user's personal identifier supplied in the HAR sample.
         user_id = str(uuid.uuid4())
         body = json.dumps(recombee_payload(code, user_id), ensure_ascii=False)
         url = recombee_signed_url()
@@ -845,25 +889,46 @@ class Spider(BaseSpider):
                    'Content-Type': 'application/json',
                    'Origin': HOST, 'Referer': video_url,
                    'User-Agent': UA}
-        try:
-            response = self.net.req(url, {
-                'method': 'POST', 'timeout': 20000,
-                'headers': headers, 'data': body,
-            })
-            if isinstance(response, str):
-                response = json.loads(response)
-            if not isinstance(response, dict):
-                raise ValueError('net.req 响应类型异常')
-            status = int(response.get('code', response.get('status', 0)) or 0)
-            raw = response.get('content', '')
-            if status != 200:
-                raise ValueError('Recombee HTTP {}'.format(status))
-            payload = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
-            return parse_recombee_results(payload, code), ''
-        except Exception as error:
-            return [], 'Recombee 推荐请求失败: {}'.format(str(error))
+        errors = []
+        # Try the FongMi networking bridge first; on some builds POST data is
+        # not forwarded as expected, so fall back to a regular Python request.
+        for transport in ('fongmi', 'urllib'):
+            try:
+                if transport == 'fongmi':
+                    response = self.net.req(url, {
+                        'method': 'POST', 'timeout': 20000,
+                        'headers': headers, 'data': body,
+                    })
+                    if isinstance(response, str):
+                        response = json.loads(response)
+                    if not isinstance(response, dict):
+                        raise ValueError('net.req 返回非字典数据')
+                    status = int(response.get('code', response.get('status', 0)) or 0)
+                    raw = response.get('content', '')
+                else:
+                    req = urllib.request.Request(url, data=body.encode('utf-8'),
+                                                 headers=headers, method='POST')
+                    with urllib.request.urlopen(req, timeout=18) as res:
+                        status = res.status
+                        raw = res.read().decode('utf-8', errors='replace')
+                if status != 200:
+                    raise ValueError('HTTP {}: {}'.format(status, str(raw)[:160]))
+                payload = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+                cards = parse_recombee_results(payload, code)
+                if cards:
+                    return cards, ''
+                # Report actual API codes when recommendations are empty.
+                if isinstance(payload, list):
+                    codes = [str(item.get('code')) for item in payload if isinstance(item, dict)]
+                    raise ValueError('接口无推荐数据，批次状态 {}'.format(','.join(codes)))
+                raise ValueError('接口返回无推荐数据')
+            except Exception as error:
+                errors.append('{}: {}'.format(transport, str(error)))
+        return [], 'Recombee 请求失败：' + '；'.join(errors)
 
     def categoryContent(self, tid, pg, filter, extend):
+        if str(tid).startswith('missaverror:'):
+            return {'list': [], 'page': 1, 'pagecount': 1}
         if str(tid).startswith(RECOMMEND_PREFIX):
             url = unquote(str(tid)[len(RECOMMEND_PREFIX):])
             if not valid_video(url):
@@ -879,13 +944,17 @@ class Spider(BaseSpider):
                 return {'list': [], 'page': 1, 'pagecount': 1,
                         'limit': 40, 'total': 0, 'msg': '无法从视频地址识别番号'}
             cards, error = self._recombee_recommendations(code, url)
+            if not cards and error:
+                cards = [{'vod_id': 'missaverror:' + quote(error[:300], safe=''),
+                          'vod_name': '相关推荐获取失败',
+                          'vod_remarks': error[:180], 'vod_pic': ''}]
             return {'list': cards, 'page': 1, 'pagecount': 1,
                     'limit': 40, 'total': len(cards),
-                    'msg': error if not cards else ''}
+                    'msg': error if error else ''}
         # Folder cards are routed to categoryContent using their vod_id.
         # Use the real entity URL as the category id to retain site pagination.
         entity_path = urlsplit(absolute(tid)).path.rstrip('/')
-        if re.match(r'^(?:/dm\d+)?/cn/(?:actresses|genres|makers)/[^/]+$', entity_path, re.I) and not entity_path.endswith('/ranking'):
+        if re.match(r'^(?:/dm\d+)?/cn/(?:actresses|genres|series|makers|labels|directors|director)/[^/]+$', entity_path, re.I) and not entity_path.endswith('/ranking'):
             selected = extend if isinstance(extend, dict) else {}
             sort = str(selected.get('sort', '') or '')
             work_filter = str(selected.get('work_filter', '') or '')
@@ -1012,7 +1081,16 @@ class Spider(BaseSpider):
         name = (' '.join(parser.title_text).strip() or
                 parser.meta.get('og:title') or vid.rsplit('/', 1)[-1])
         code, _ = version_info(vid)
-        actresses = parse_detail_actresses(source)
+        entities = parse_detail_entities(source)
+        actresses = entities['actresses'] or parse_detail_actresses(source)
+        directors = entities['directors'] + entities['director'] or parse_detail_directors(source)
+        director_links = []
+        for director_name, director_url in directors:
+            target = {'id': director_url, 'name': director_name, 'type_flag': 1}
+            try:
+                director_links.append(self.link(director_name, target))
+            except Exception:
+                director_links.append(director_name)
         actress_links = []
         for actress_name, actress_url in actresses:
             target = {'id': actress_url, 'name': actress_name, 'type_flag': 1}
@@ -1020,6 +1098,22 @@ class Spider(BaseSpider):
                 actress_links.append(self.link(actress_name, target))
             except Exception:
                 actress_links.append(actress_name)
+        def clickable_entities(items):
+            links = []
+            for display_name, entity_url in items:
+                target = {'id': entity_url, 'name': display_name, 'type_flag': 1}
+                try:
+                    links.append(self.link(display_name, target))
+                except Exception:
+                    links.append(display_name)
+            return '、'.join(links)
+
+        extra_rows = []
+        for label, kind in (('类型', 'genres'), ('系列', 'series'),
+                            ('发行商', 'makers'), ('标签', 'labels')):
+            values = clickable_entities(entities[kind])
+            if values:
+                extra_rows.append(label + '：' + values)
         # Separate category-style recommendation entry, not a playback line.
         recommend_target = {'id': RECOMMEND_PREFIX + quote(absolute(vid), safe=''),
                             'name': '相关推荐', 'type_flag': 1}
@@ -1085,8 +1179,9 @@ class Spider(BaseSpider):
         return {'list': [{
             'vod_id': vid, 'vod_name': name,
             'vod_pic': absolute(parser.meta.get('og:image')) if parser.meta.get('og:image') else '',
-            'vod_actor': '、'.join(actress_links + [recommend_link]),
-            'vod_director': 'MissAV',
+            'vod_actor': '\n'.join(filter(None, ['、'.join(actress_links), recommend_link] + extra_rows)),
+            'vod_director': '、'.join(director_links),
+            'vod_area': 'MissAV',
             'vod_content': parser.meta.get('description', '') +
                            ('\n可选版本：' + '、'.join(label for label, _ in groups)
                             if groups else '\n没有解析出有效播放线路'),
