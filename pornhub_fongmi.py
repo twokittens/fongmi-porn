@@ -694,16 +694,60 @@ def check_full_hls(url, referer, expected):
     return duration >= max(20, expected * 0.7)
 
 
-def make_play_id(page_url, quality):
-    # Store a stable page URL and quality, never an expiring signed CDN URL.
-    return urllib.parse.quote(json.dumps({'page': page_url, 'quality': quality},
-                                         ensure_ascii=False), safe='')
+def ordered_media(definitions, quality='auto'):
+    """Preserve original v26 selection ordering."""
+    items = list(definitions or [])
+    target = quality_number(quality) if quality != 'auto' else 0
+    if target:
+        items.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
+                                  not d['default']))
+    else:
+        items.sort(key=lambda d: (not d['default'], d['master'],
+                                  abs(d['quality'] - 720) if d['quality'] else 9999))
+    return items
+
+
+def usable_hls(url, created=0):
+    """Conservatively reuse an HLS URL; fall back to a fresh page when old."""
+    if not isinstance(url, str):
+        return False
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != 'https' or not parsed.hostname or not parsed.path.lower().endswith('.m3u8'):
+        return False
+    now = time.time()
+    if created:
+        try:
+            if now - float(created) > 240 or float(created) > now + 60:
+                return False
+        except (ValueError, TypeError):
+            return False
+    query = urllib.parse.parse_qs(parsed.query)
+    for key in ('validto', 'expires', 'expire', 'exp'):
+        if key in query:
+            try:
+                expiry = float(query[key][0])
+                if expiry > 1e12:
+                    expiry /= 1000
+                return expiry > now + 120
+            except (ValueError, TypeError, IndexError):
+                return False
+    # Signed URLs without a readable expiry are only reused very briefly.
+    return bool(created) and now - float(created) < 120
+
+
+def make_play_id(page_url, quality, media_url='', created=None):
+    """Embed the HLS URL from detailContent to avoid a second page download."""
+    data = {'page': page_url, 'quality': quality}
+    if media_url:
+        data['hls'] = media_url
+        data['created'] = int(created if created is not None else time.time())
+    return urllib.parse.quote(json.dumps(data, ensure_ascii=False, separators=(',', ':')), safe='')
 
 class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v25（真实详情信息及播放修复）'
+        return 'Pornhub v26（快速启动播放）'
 
     def safe_link(self, name, target):
         # FongMi link expects a target dictionary, not a plain string.
@@ -842,8 +886,13 @@ class Spider(BaseSpider):
                 media = media_definitions(source)
             except Exception:
                 media = []
-            urls = ['自动$' + make_play_id(url, 'auto')]
-            urls += [str(q) + 'P$' + make_play_id(url, str(q))
+            captured_at = time.time()
+            def play_item(label, quality):
+                ordered = ordered_media(media, quality)
+                selected = ordered[0]['url'] if ordered else ''
+                return label + '$' + make_play_id(url, quality, selected, captured_at)
+            urls = [play_item('自动', 'auto')]
+            urls += [play_item(str(q) + 'P', str(q))
                      for q in sorted(set(d['quality'] for d in media if d['quality'] and not d['master']), reverse=True)]
             if not media:
                 urls.append('网页回退$' + urllib.parse.quote(url, safe=''))
@@ -858,10 +907,9 @@ class Spider(BaseSpider):
                               'vod_play_from': '实时HLS',
                               'vod_play_url': '自动$' + make_play_id(fallback_url, 'auto')}]} 
     def playerContent(self, flag, id, vipFlags=None):
-        """Refresh signed HLS and verify its manifest before handing it to FongMi."""
+        """Fast path: reuse freshly parsed HLS; refresh only if expired/absent."""
         try:
-            value = urllib.parse.unquote(str(id))
-            data = json.loads(value)
+            data = json.loads(urllib.parse.unquote(str(id)))
             page = str(data.get('page') or '')
             quality = str(data.get('quality') or 'auto').lower().replace('p', '').strip()
             parsed = urllib.parse.urlsplit(page)
@@ -870,20 +918,14 @@ class Spider(BaseSpider):
                     parsed.path != '/view_video.php' or
                     not urllib.parse.parse_qs(parsed.query).get('viewkey')):
                 return {'parse': 0, 'url': '', 'msg': '无效视频页面'}
-            source = get(page)
-            definitions = media_definitions(source)
-            if not definitions:
-                return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
-            target = quality_number(quality) if quality != 'auto' else 0
-            if target:
-                definitions.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
-                                                 not d['default']))
-            else:
-                definitions.sort(key=lambda d: (not d['default'], d['master'],
-                                                 abs(d['quality'] - 720) if d['quality'] else 9999))
-            # CDN signed URLs are time-sensitive. No preflight GET, which can
-            # consume the validity window before FongMi opens the manifest.
-            media_url = definitions[0]['url']
+
+            media_url = str(data.get('hls') or '')
+            if not usable_hls(media_url, data.get('created')):
+                source = get(page)
+                definitions = ordered_media(media_definitions(source), quality)
+                if not definitions:
+                    return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
+                media_url = definitions[0]['url']
             return {'parse': 0, 'url': media_url, 'header': {
                 'User-Agent': HEADERS['User-Agent'],
                 'Referer': page,
