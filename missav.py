@@ -327,30 +327,6 @@ class PageParser(HTMLParser):
             self.cards.append(self.stack.pop())
 
 
-
-def video_duration(item):
-    """Read a visible duration or explicit duration attribute on the video card."""
-    image = item.get('img') or {}
-    for key in ('data-duration', 'duration', 'data-video-duration'):
-        raw = str(image.get(key) or '').strip()
-        if raw:
-            if re.fullmatch(r'\d{1,2}:\d{2}(?::\d{2})?', raw):
-                return raw
-            if raw.isdigit() and int(raw) >= 60:
-                seconds = int(raw)
-                return '%d:%02d' % (seconds // 60, seconds % 60)
-    text = ' '.join(item.get('text') or [])
-    # Prefer clock-shaped timestamps; avoid matching numeric video identifiers.
-    matches = re.findall(r'(?<![\d:])(\d{1,2}:\d{2}(?::\d{2})?)(?![\d:])', text)
-    for value in reversed(matches):
-        parts = [int(x) for x in value.split(':')]
-        if len(parts) == 2 and parts[1] < 60:
-            return value
-        if len(parts) == 3 and parts[1] < 60 and parts[2] < 60:
-            return value
-    return ''
-
-
 def parse_videos(source):
     parser = PageParser()
     parser.feed(source)
@@ -372,8 +348,7 @@ def parse_videos(source):
         seen.add(url)
         result.append({'vod_id': url, 'vod_name': name,
                        'vod_pic': absolute(pic) if pic else '',
-                       'vod_remarks': (code.upper() + ' · ' + video_duration(item)
-                                       if video_duration(item) else code.upper()),
+                       'vod_remarks': code.upper(),
                        'style': {'type': 'rect', 'ratio': 1.78}})
     return result, parser
 
