@@ -280,6 +280,64 @@ def valid_video(url):
     return path.lower() not in blocked and bool(re.search(r'\d', path))
 
 
+RECOMMEND_PREFIX = 'missavrecommend:'
+
+
+def parse_recommendation_cards(source, current_url, limit=40):
+    """Only actual server-rendered Recombee recommendation links; never invent URLs."""
+    from html.parser import HTMLParser
+
+    class Finder(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.stack = []
+            self.cards = []
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == 'a':
+                href = html.unescape(attrs.get('href', ''))
+                frag = urlsplit(href).fragment.lower()
+                eligible = any(x in frag for x in (
+                    'watch-next-side', 'watch-next-bottom', 'mobile-watch-next'))
+                self.stack.append({'href': href.split('#', 1)[0], 'ok': eligible,
+                                   'name': attrs.get('title', ''), 'pic': '', 'text': []})
+            elif tag == 'img' and self.stack and self.stack[-1]['ok']:
+                a = self.stack[-1]
+                a['pic'] = (attrs.get('data-src') or attrs.get('data-original')
+                            or attrs.get('src') or '')
+                a['name'] = a['name'] or attrs.get('alt', '')
+
+        def handle_data(self, data):
+            if self.stack:
+                self.stack[-1]['text'].append(data)
+
+        def handle_endtag(self, tag):
+            if tag == 'a' and self.stack:
+                item = self.stack.pop()
+                if item['ok']:
+                    self.cards.append(item)
+
+    finder = Finder()
+    finder.feed(source)
+    current = absolute(current_url).split('#', 1)[0]
+    cards, seen = [], set()
+    for item in finder.cards:
+        url = absolute(item['href'])
+        if not valid_video(url) or url == current or url in seen:
+            continue
+        seen.add(url)
+        name = re.sub(r'\s+', ' ', item['name'] or ' '.join(item['text'])).strip()
+        cards.append({'vod_id': url,
+                      'vod_name': name or unquote(urlsplit(url).path.split('/')[-1]),
+                      'vod_pic': absolute(item['pic']) if item['pic'] and not item['pic'].startswith('data:') else '',
+                      'vod_remarks': unquote(urlsplit(url).path.split('/')[-1]).upper(),
+                      'style': {'type': 'rect', 'ratio': 1.78}})
+        if len(cards) >= limit:
+            break
+    return cards
+
+
 class PageParser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -690,6 +748,23 @@ class Spider(BaseSpider):
         return {'list': []}
 
     def categoryContent(self, tid, pg, filter, extend):
+        if str(tid).startswith(RECOMMEND_PREFIX):
+            url = unquote(str(tid)[len(RECOMMEND_PREFIX):])
+            if not valid_video(url):
+                return {'list': [], 'page': 1, 'pagecount': 1, 'limit': 40, 'total': 0}
+            try:
+                page = max(1, int(pg))
+            except (TypeError, ValueError):
+                page = 1
+            if page > 1:
+                return {'list': [], 'page': page, 'pagecount': page, 'limit': 40, 'total': 0}
+            status, body, blocked = self._request(url)
+            cards = parse_recommendation_cards(body, url) if status == 200 and not blocked else []
+            # MissAV recommendations are populated by client-side Recombee JavaScript.
+            # When absent from HTTP HTML, don't substitute unrelated search results.
+            return {'list': cards, 'page': 1, 'pagecount': 1,
+                    'limit': 40, 'total': len(cards),
+                    'msg': '' if cards else '当前网页源码未包含相关推荐卡片（网站通过 JavaScript 动态加载）。'}
         # Folder cards are routed to categoryContent using their vod_id.
         # Use the real entity URL as the category id to retain site pagination.
         entity_path = urlsplit(absolute(tid)).path.rstrip('/')
@@ -828,6 +903,13 @@ class Spider(BaseSpider):
                 actress_links.append(self.link(actress_name, target))
             except Exception:
                 actress_links.append(actress_name)
+        # Separate category-style recommendation entry, not a playback line.
+        recommend_target = {'id': RECOMMEND_PREFIX + quote(absolute(vid), safe=''),
+                            'name': '相关推荐', 'type_flag': 1}
+        try:
+            recommend_link = self.link('相关推荐', recommend_target)
+        except Exception:
+            recommend_link = '相关推荐'
         # Discover real same-code variants via the verified /cn/search/<code> page.
         # Do not guess /dmNN/ paths: they can differ between versions.
         candidates = [vid]
@@ -887,6 +969,7 @@ class Spider(BaseSpider):
             'vod_id': vid, 'vod_name': name,
             'vod_pic': absolute(parser.meta.get('og:image')) if parser.meta.get('og:image') else '',
             'vod_actor': '、'.join(actress_links),
+            'vod_director': recommend_link,
             'vod_content': parser.meta.get('description', '') +
                            ('\n可选版本：' + '、'.join(label for label, _ in groups)
                             if groups else '\n没有解析出有效播放线路'),
