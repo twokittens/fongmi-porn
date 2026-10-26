@@ -34,8 +34,13 @@ def clean(value):
 def absolute(url):
     return urllib.parse.urljoin(HOST, html.unescape(url or ''))
 
-def get(url):
-    req = urllib.request.Request(absolute(url), headers=HEADERS)
+DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+
+def get(url, desktop=False):
+    headers = dict(HEADERS)
+    if desktop:
+        headers['User-Agent'] = DESKTOP_UA
+    req = urllib.request.Request(absolute(url), headers=headers)
     with urllib.request.urlopen(req, timeout=18) as resp:
         charset = resp.headers.get_content_charset() or 'utf-8'
         return resp.read().decode(charset, errors='replace')
@@ -781,7 +786,7 @@ class Spider(BaseSpider):
                     params.append(('page', str(pg)))
                 if params:
                     path += '?' + urllib.parse.urlencode(params)
-                stars = parse_pornstars(get(path))
+                stars = parse_pornstars(get(path, desktop=True))
                 return {'list': stars, 'page': pg,
                         'pagecount': pg + 1 if stars else pg,
                         'limit': len(stars), 'total': 999999 if stars else 0}
