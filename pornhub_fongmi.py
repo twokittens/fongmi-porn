@@ -35,10 +35,23 @@ def absolute(url):
     return urllib.parse.urljoin(HOST, html.unescape(url or ''))
 
 def get(url):
-    req = urllib.request.Request(absolute(url), headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=18) as resp:
-        charset = resp.headers.get_content_charset() or 'utf-8'
-        return resp.read().decode(charset, errors='replace')
+    """Retry only transient transport/server errors, never access-denied responses."""
+    last = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(absolute(url), headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                charset = resp.headers.get_content_charset() or 'utf-8'
+                return resp.read().decode(charset, errors='replace')
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (408, 429, 500, 502, 503, 504):
+                raise
+            last = exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last = exc
+        if attempt == 0:
+            time.sleep(0.35)
+    raise last
 
 def attrs_dict(attrs):
     return dict(attrs)
@@ -694,11 +707,13 @@ def check_full_hls(url, referer, expected):
     return duration >= max(20, expected * 0.7)
 
 
-def make_play_id(page_url, quality, media_url=''):
+def make_play_id(page_url, quality, media_url='', alternatives=None):
     """Carry the freshly parsed HLS URL into playback; refresh only when stale."""
     payload = {'page': page_url, 'quality': quality}
     if media_url:
         payload['hls'] = media_url
+    if alternatives:
+        payload['alternatives'] = [x for x in alternatives if x != media_url][:5]
     return urllib.parse.quote(json.dumps(payload, ensure_ascii=False, separators=(',', ':')), safe='')
 
 
@@ -736,11 +751,44 @@ def hls_is_fresh(url, margin=90):
                 return False
     return True
 
+def ordered_hls(definitions, quality='auto'):
+    """Return distinct candidate URLs in v26 quality preference order."""
+    target = quality_number(quality) if quality != 'auto' else 0
+    items = list(definitions)
+    if target:
+        items.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
+                                  not d['default']))
+    else:
+        items.sort(key=lambda d: (not d['default'], d['master'],
+                                  abs(d['quality'] - 720) if d['quality'] else 9999))
+    result = []
+    for item in items:
+        if item['url'] not in result:
+            result.append(item['url'])
+    return result
+
+
+def hls_probe(url, referer):
+    """Quick GET on the manifest, not a media download; no redirects to HTML."""
+    if not hls_is_fresh(url):
+        return False
+    headers = {**HEADERS, 'Referer': referer,
+               'Origin': urllib.parse.urlsplit(referer).scheme + '://' + urllib.parse.urlsplit(referer).netloc,
+               'Accept': 'application/vnd.apple.mpegurl, application/x-mpegURL, */*'}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as response:
+            mime = (response.headers.get('Content-Type') or '').lower()
+            data = response.read(131072)
+        return 'text/html' not in mime and data.lstrip().startswith(b'#EXTM3U')
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return False
+
 class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v26（HLS 单次请求优化）'
+        return 'Pornhub v26（HLS 410 自动切换测试）'
 
     def safe_link(self, name, target):
         # FongMi link expects a target dictionary, not a plain string.
@@ -879,8 +927,8 @@ class Spider(BaseSpider):
                 media = media_definitions(source)
             except Exception:
                 media = []
-            urls = ['自动$' + make_play_id(url, 'auto', select_hls(media, 'auto'))]
-            urls += [str(q) + 'P$' + make_play_id(url, str(q), select_hls(media, str(q)))
+            urls = ['自动$' + make_play_id(url, 'auto', select_hls(media, 'auto'), ordered_hls(media, 'auto'))]
+            urls += [str(q) + 'P$' + make_play_id(url, str(q), select_hls(media, str(q)), ordered_hls(media, str(q)))
                      for q in sorted(set(d['quality'] for d in media if d['quality'] and not d['master']), reverse=True)]
             if not media:
                 urls.append('网页回退$' + urllib.parse.quote(url, safe=''))
@@ -895,10 +943,9 @@ class Spider(BaseSpider):
                               'vod_play_from': '实时HLS',
                               'vod_play_url': '自动$' + make_play_id(fallback_url, 'auto')}]} 
     def playerContent(self, flag, id, vipFlags=None):
-        """Use detail-page HLS directly; re-fetch HTML only if absent or expired."""
+        """Preflight HLS, rotate known alternatives, refresh HTML once on failure."""
         try:
-            value = urllib.parse.unquote(str(id))
-            data = json.loads(value)
+            data = json.loads(urllib.parse.unquote(str(id)))
             page = str(data.get('page') or '')
             quality = str(data.get('quality') or 'auto').lower().replace('p', '').strip()
             parsed = urllib.parse.urlsplit(page)
@@ -908,17 +955,31 @@ class Spider(BaseSpider):
                     not urllib.parse.parse_qs(parsed.query).get('viewkey')):
                 return {'parse': 0, 'url': '', 'msg': '无效视频页面'}
 
-            media_url = str(data.get('hls') or '')
-            if not hls_is_fresh(media_url):
-                source = get(page)
-                media_url = select_hls(media_definitions(source), quality)
-                if not media_url:
-                    return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
+            headers = {'User-Agent': HEADERS['User-Agent'], 'Referer': page,
+                       'Origin': parsed.scheme + '://' + parsed.netloc}
+            initial = data.get('hls') or ''
+            alternatives = data.get('alternatives') or []
+            if not isinstance(alternatives, list):
+                alternatives = []
+            candidates = [initial] + alternatives
+            seen = set()
+            for url in candidates:
+                if not hls_is_fresh(url) or url in seen:
+                    continue
+                seen.add(url)
+                if hls_probe(url, page):
+                    return {'parse': 0, 'url': url, 'header': headers}
 
-            return {'parse': 0, 'url': media_url, 'header': {
-                'User-Agent': HEADERS['User-Agent'],
-                'Referer': page,
-                'Origin': parsed.scheme + '://' + parsed.netloc,
-            }}
+            # Only refresh HTML after the previously extracted URLs fail.
+            source = get(page)
+            definitions = media_definitions(source)
+            for url in ordered_hls(definitions, quality):
+                if url in seen or not hls_is_fresh(url):
+                    continue
+                seen.add(url)
+                if hls_probe(url, page):
+                    return {'parse': 0, 'url': url, 'header': headers}
+            return {'parse': 0, 'url': '',
+                    'msg': 'HLS 列表不可访问（可能为 HTTP 410/403 或网络错误），已尝试备用源'}
         except Exception as exc:
             return {'parse': 0, 'url': '', 'msg': '播放解析失败：' + type(exc).__name__}
