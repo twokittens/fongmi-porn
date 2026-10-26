@@ -530,7 +530,7 @@ def quality_number(value):
 
 
 def media_definitions(source):
-    """Read player mediaDefinitions without treating quality arrays as a single resolution."""
+    """Return distinct HLS sources. Array quality is a master, not a single tier."""
     config = player_config(source)
     result, seen = [], set()
     for entry in config.get('mediaDefinitions', []):
@@ -547,13 +547,11 @@ def media_definitions(source):
             continue
         seen.add(url)
         raw_quality = entry.get('quality') or entry.get('height')
-        # An array lists available tiers, not the resolution of this URL.
-        # Keep its original ordering as a fallback but never advertise it as 1080P.
+        quality = quality_number(raw_quality)
+        # Arrays often describe the master playlist, not its actual resolution.
         is_master = isinstance(raw_quality, (list, tuple))
-        quality = 0 if is_master else quality_number(raw_quality)
         result.append({'quality': quality, 'url': url,
-                       'master': is_master, 'default': bool(entry.get('defaultQuality')),
-                       'remote': bool(entry.get('remote'))})
+                       'master': is_master, 'default': bool(entry.get('defaultQuality'))})
     return result
 
 
@@ -705,7 +703,7 @@ class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v29（v26稳定播放优化）'
+        return 'Pornhub v25（真实详情信息及播放修复）'
 
     def safe_link(self, name, target):
         # FongMi link expects a target dictionary, not a plain string.
@@ -878,19 +876,11 @@ class Spider(BaseSpider):
                 return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
             target = quality_number(quality) if quality != 'auto' else 0
             if target:
-                # Exact quality first; next prefer another scalar tier. An array
-                # entry is not necessarily the requested variant playlist.
-                definitions.sort(key=lambda d: (
-                    d['master'],
-                    abs(d['quality'] - target) if d['quality'] else 9999,
-                    d['remote'],
-                    not d['default']))
+                definitions.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
+                                                 not d['default']))
             else:
-                # Preserve v26's fast start: prefer the site's actual default
-                # stream, avoid speculative high-quality/master selection.
-                definitions.sort(key=lambda d: (
-                    not d['default'], d['master'], d['remote'],
-                    abs(d['quality'] - 720) if d['quality'] else 9999))
+                definitions.sort(key=lambda d: (not d['default'], d['master'],
+                                                 abs(d['quality'] - 720) if d['quality'] else 9999))
             # CDN signed URLs are time-sensitive. No preflight GET, which can
             # consume the validity window before FongMi opens the manifest.
             media_url = definitions[0]['url']
