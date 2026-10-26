@@ -769,289 +769,88 @@ def ordered_hls(definitions, quality='auto'):
 
 
 def hls_probe(url, referer):
-    """Quick GET on the manifest, not a media download; no redirects to HTML."""
-    if not hls_is_fresh(url):
-        return False
-    headers = {**HEADERS, 'Referer': referer,
-               'Origin': urllib.parse.urlsplit(referer).scheme + '://' + urllib.parse.urlsplit(referer).netloc,
-               'Accept': 'application/vnd.apple.mpegurl, application/x-mpegURL, */*'}
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as response:
-            mime = (response.headers.get('Content-Type') or '').lower()
-            data = response.read(131072)
-        return 'text/html' not in mime and data.lstrip().startswith(b'#EXTM3U')
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, ValueError):
-        return False
+    """Check master, media playlist, init map, and first two segments.
 
-def diagnose_hls(url, referer):
-    """Small, bounded network checks; return stage and status, never expose signed URLs."""
-    import socket
-    headers = {**HEADERS, 'Referer': referer,
+    Return (ok, reason). A 200 manifest alone does NOT mean a playable HLS.
+    All requests use the same headers that we return to FongMi.
+    """
+    if not hls_is_fresh(url, margin=30):
+        return False, '签名已过期或地址格式错误'
+    headers = {'User-Agent': HEADERS['User-Agent'], 'Referer': referer,
                'Origin': urllib.parse.urlsplit(referer).scheme + '://' + urllib.parse.urlsplit(referer).netloc,
                'Accept': '*/*'}
-    def check(target, stage, segment=False):
+
+    def fetch(target, binary=False):
+        request_headers = dict(headers)
+        if binary:
+            request_headers['Range'] = 'bytes=0-1023'
         try:
-            req_headers = dict(headers)
-            if segment:
-                req_headers['Range'] = 'bytes=0-1023'
-            req = urllib.request.Request(target, headers=req_headers)
-            with urllib.request.urlopen(req, timeout=6) as response:
-                status = response.status
-                data = response.read(2048 if segment else 131072)
-                content_type = (response.headers.get('Content-Type') or '').lower()
-            if segment:
-                if 'text/html' in content_type or data.lstrip().startswith(b'<!DOCTYPE html'):
-                    return None, stage + ': HTML代替视频'
-                return data, stage + ': HTTP ' + str(status)
-            if not data.lstrip().startswith(b'#EXTM3U'):
-                return None, stage + ': HTTP ' + str(status) + ' 非M3U8'
-            return data.decode('utf-8-sig', 'replace'), stage + ': HTTP ' + str(status)
+            req = urllib.request.Request(target, headers=request_headers)
+            with urllib.request.urlopen(req, timeout=5) as response:
+                code = getattr(response, 'status', 200)
+                mime = (response.headers.get('Content-Type') or '').lower()
+                raw = response.read(1024 if binary else 512 * 1024)
+            if code not in (200, 206) or 'text/html' in mime or raw.lstrip().lower().startswith((b'<!doctype html', b'<html')):
+                return None, 'HTTP%d/HTML' % code
+            if binary:
+                return raw if raw else None, 'HTTP%d' % code
+            if not raw.lstrip().startswith(b'#EXTM3U'):
+                return None, '非M3U8'
+            return raw.decode('utf-8-sig', 'replace'), 'HTTP%d' % code
         except urllib.error.HTTPError as exc:
-            return None, stage + ': HTTP ' + str(exc.code)
+            return None, 'HTTP%d' % exc.code
         except urllib.error.URLError as exc:
-            reason = exc.reason
-            kind = type(reason).__name__
-            if isinstance(reason, socket.timeout): kind = 'Timeout'
-            return None, stage + ': URLError/' + kind
-        except (TimeoutError, OSError, ValueError) as exc:
-            return None, stage + ': ' + type(exc).__name__
+            return None, 'URLError/%s' % type(exc.reason).__name__
+        except (OSError, ValueError, TimeoutError) as exc:
+            return None, type(exc).__name__
 
-    def next_uri(manifest):
-        lines = manifest.splitlines()
-        for i, line in enumerate(lines):
-            if line.strip().startswith('#EXT-X-STREAM-INF'):
-                for item in lines[i+1:]:
-                    item = item.strip()
-                    if item and not item.startswith('#'):
-                        return item
-        for item in lines:
-            item = item.strip()
-            if item and not item.startswith('#'):
-                return item
-        return ''
-
-    if not hls_is_fresh(url, margin=0):
-        return '签名: 已过期/地址无效'
-    messages = []
-    manifest, result = check(url, '主列表')
-    messages.append(result)
-    if manifest is None: return ' | '.join(messages)
-    if '#EXT-X-STREAM-INF' in manifest:
-        child = next_uri(manifest)
-        if not child: return ' | '.join(messages + ['子列表: 未找到'])
-        child_url = urllib.parse.urljoin(url, child)
-        manifest, result = check(child_url, '子列表')
-        messages.append(result)
-        if manifest is None: return ' | '.join(messages)
-        base_url = child_url
+    current = url
+    for depth in range(4):
+        content, status = fetch(current)
+        if content is None:
+            return False, ('播放列表' if depth else '主列表') + ':' + status
+        if '#EXT-X-STREAM-INF' not in content:
+            break
+        lines = content.splitlines()
+        variants = playlist_variants(current, content, referer)
+        if not variants:
+            return False, '主列表无子播放列表'
+        # Prefer a media variant closest to 720p. This does not change the
+        # selected master URL, only the preflight path.
+        variants.sort(key=lambda item: (abs((item[0] or 720) - 720), -(item[0] or 0)))
+        current = variants[0][1]
     else:
-        base_url = url
-    segment = next_uri(manifest)
-    if not segment: return ' | '.join(messages + ['分片: 未找到'])
-    segment_url = urllib.parse.urljoin(base_url, segment)
-    _, result = check(segment_url, '首分片', segment=True)
-    messages.append(result)
-    return ' | '.join(messages)
+        return False, '播放列表嵌套过深'
 
-
-def diagnose_compare(url, referer):
-    """Compare repeated first-segment requests without exposing signed URLs."""
-    import hashlib
-    import socket
-    def identity(target):
-        p = urllib.parse.urlsplit(target)
-        q = urllib.parse.parse_qs(p.query)
-        exp = next((q[k][0] for k in ('validto', 'expires', 'expire', 'exp') if k in q), '')
-        try:
-            remaining = str(int(float(exp) - time.time())) + 's' if exp else '?'
-        except (TypeError, ValueError):
-            remaining = '?'
-        token = hashlib.sha256(target.encode('utf-8')).hexdigest()[:10]
-        return '%s #%s 剩余%s' % (p.hostname or '?', token, remaining)
-
-    headers = {**HEADERS, 'Referer': referer,
-               'Origin': urllib.parse.urlsplit(referer).scheme + '://' + urllib.parse.urlsplit(referer).netloc,
-               'Accept': '*/*'}
-    def fetch(target, segment=False):
-        try:
-            h = dict(headers)
-            if segment:
-                h['Range'] = 'bytes=0-1023'
-            req = urllib.request.Request(target, headers=h)
-            with urllib.request.urlopen(req, timeout=6) as response:
-                status = getattr(response, 'status', 200)
-                raw = response.read(2048 if segment else 131072)
-                final_url = response.geturl()
-                ctype = (response.headers.get('Content-Type') or '').lower()
-            if not segment and not raw.lstrip().startswith(b'#EXTM3U'):
-                return None, 'HTTP%d/非M3U8' % status, final_url
-            if segment and ('text/html' in ctype or raw.lstrip().startswith(b'<!DOCTYPE html')):
-                return None, 'HTTP%d/HTML' % status, final_url
-            return (raw if segment else raw.decode('utf-8-sig', 'replace')), 'HTTP%d' % status, final_url
-        except urllib.error.HTTPError as e:
-            return None, 'HTTP%d' % e.code, target
-        except urllib.error.URLError as e:
-            reason = e.reason
-            return None, 'URL/' + ('Timeout' if isinstance(reason, socket.timeout) else type(reason).__name__), target
-        except (OSError, TimeoutError, ValueError) as e:
-            return None, type(e).__name__, target
-
-    def first_uri(content):
-        for line in content.splitlines():
-            line = line.strip()
-            if line and not line.startswith('#'):
-                return line
-        return ''
-
-    if not hls_is_fresh(url, margin=0):
-        return 'HLS过期/无效 ' + identity(url)
-    master, status, final = fetch(url)
-    result = ['主:%s' % status, '主地址:%s' % identity(final)]
-    if master is None:
-        return ' | '.join(result)
-    child_url = final
-    if '#EXT-X-STREAM-INF' in master:
-        path = first_uri(master)
-        if not path:
-            return ' | '.join(result + ['子:未找到'])
-        child_url = urllib.parse.urljoin(final, path)
-        child, status, final_child = fetch(child_url)
-        result.append('子:%s' % status)
-        if child is None:
-            return ' | '.join(result + ['子地址:' + identity(child_url)])
-        master, child_url = child, final_child
-    path = first_uri(master)
-    if not path:
-        return ' | '.join(result + ['分片:未找到'])
-    seg = urllib.parse.urljoin(child_url, path)
-    result.append('分片地址:' + identity(seg))
-    # Same URL, same request headers, repeated twice: distinguishes persistent 410 from intermittent 410.
-    for i in range(2):
-        _, status, _ = fetch(seg, segment=True)
-        result.append('首分片第%d次:%s' % (i+1, status))
-    return ' | '.join(result)
-
-
-
-def full_hls_diagnostic(page, initial_url=''):
-    """One-click bounded diagnosis. Does not claim to observe MPV's own requests."""
-    import hashlib
-    import socket
-    from datetime import datetime
-    results = []
-    origin = urllib.parse.urlsplit(page).scheme + '://' + urllib.parse.urlsplit(page).netloc
-
-    def fingerprint(url):
-        p = urllib.parse.urlsplit(url)
-        return (p.hostname or '?') + '/' + hashlib.sha256(p.path.encode()).hexdigest()[:7] + ':' + hashlib.sha256(url.encode()).hexdigest()[:7]
-
-    def expiry(url):
-        q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
-        for key in ('validto', 'expires', 'expire', 'exp'):
-            if key in q:
-                try:
-                    v = float(q[key][0]); v = v / 1000 if v > 1e12 else v
-                    return str(int(v-time.time())) + 's'
-                except (ValueError, TypeError):
-                    return 'invalid'
-        return '?'
-
-    def request(url, stage, mode='manifest', headers_mode='full'):
-        h = {'User-Agent': HEADERS['User-Agent'], 'Accept': '*/*'}
-        if headers_mode in ('full', 'no-origin'):
-            h['Referer'] = page
-        if headers_mode == 'full':
-            h['Origin'] = origin
-        if mode == 'range':
-            h['Range'] = 'bytes=0-1023'
-        try:
-            req = urllib.request.Request(url, headers=h)
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                status = getattr(resp, 'status', 200)
-                mime = (resp.headers.get('Content-Type') or '').lower()
-                body = resp.read(131072 if mode == 'manifest' else 2048)
-                resolved = resp.geturl()
-            if mode == 'manifest' and not body.lstrip().startswith(b'#EXTM3U'):
-                return None, 'HTTP%d 非M3U8' % status, resolved
-            if mode != 'manifest' and ('text/html' in mime or body.lstrip().startswith(b'<!DOCTYPE')):
-                return None, 'HTTP%d HTML' % status, resolved
-            return body.decode('utf-8-sig', 'replace') if mode == 'manifest' else body, 'HTTP%d' % status, resolved
-        except urllib.error.HTTPError as e:
-            return None, 'HTTP%d' % e.code, url
-        except urllib.error.URLError as e:
-            reason = e.reason
-            label = 'timeout' if isinstance(reason, (socket.timeout, TimeoutError)) else type(reason).__name__
-            return None, 'URL/' + label, url
-        except (OSError, ValueError, TimeoutError) as e:
-            return None, type(e).__name__, url
-
-    def uris(manifest):
-        return [line.strip() for line in manifest.splitlines() if line.strip() and not line.lstrip().startswith('#')]
-
-    snapshots = []
-    for idx in range(2):
-        if idx == 0 and initial_url:
-            root = initial_url
-            results.append('A 使用详情页HLS')
-        else:
-            try:
-                start = time.monotonic()
-                source = get(page)
-                defs = media_definitions(source)
-                root = select_hls(defs, 'auto')
-                results.append('%s 网页OK %dms HLS%d' % ('A' if idx == 0 else 'B', int((time.monotonic()-start)*1000), len(defs)))
-            except Exception as e:
-                results.append('%s 网页失败:%s%s' % ('A' if idx == 0 else 'B', type(e).__name__, ' HTTP%d' % e.code if isinstance(e, urllib.error.HTTPError) else ''))
-                continue
-        if not root:
-            results.append('无HLS地址'); continue
-        results.append('主:%s 到期:%s' % (fingerprint(root), expiry(root)))
-        master, status, actual = request(root, 'master')
-        results.append('主列表:' + status)
-        if master is None: continue
-        base = actual
-        if '#EXT-X-STREAM-INF' in master:
-            choices = uris(master)
-            if not choices:
-                results.append('子列表:无URL'); continue
-            child_url = urllib.parse.urljoin(base, choices[0])
-            results.append('子:%s 到期:%s' % (fingerprint(child_url), expiry(child_url)))
-            child, status, base = request(child_url, 'child')
-            results.append('子列表:' + status)
-            if child is None: continue
-            master = child
-        choices = uris(master)
-        if not choices:
-            results.append('分片:无URL'); continue
-        # EXT-X-MAP is important for fragmented MP4: init segment is not the first media URI.
-        map_match = re.search(r'#EXT-X-MAP:.*?URI=[\"\']([^\"\']+)', master)
-        if map_match:
-            init_url = urllib.parse.urljoin(base, map_match.group(1))
-            _, st, _ = request(init_url, 'init', 'range')
-            results.append('初始化分片:' + st)
-        seg = urllib.parse.urljoin(base, choices[0])
-        snapshots.append(seg)
-        results.append('首分片:%s 到期:%s' % (fingerprint(seg), expiry(seg)))
-        for name, mode, header in [('Range+完整头','range','full'),('普通GET+完整头','segment','full'),('Range+无Origin','range','no-origin'),('Range+UA','range','ua')]:
-            _, st, _ = request(seg, name, mode, header)
-            results.append(name+':'+st)
-        if len(choices)>1:
-            seg2 = urllib.parse.urljoin(base, choices[1])
-            _, st, _ = request(seg2, 'second', 'range')
-            results.append('第二分片:'+st)
-    if len(snapshots) == 2:
-        a,b = snapshots
-        pa,pb = urllib.parse.urlsplit(a),urllib.parse.urlsplit(b)
-        results.append('AB首分片:域名%s 路径%s 完整URL%s' % ('同' if pa.hostname==pb.hostname else '异', '同' if pa.path==pb.path else '异', '同' if a==b else '异'))
-    results.append('说明:这是Python网络测试,不等同MPV真实请求')
-    return '\n'.join(results)
+    # EXT-X-MAP is mandatory for fMP4; if its URL is gone, MPV cannot decode.
+    for line in content.splitlines():
+        if line.startswith('#EXT-X-MAP:'):
+            m = re.search(r'URI=["\']([^"\']+)["\']', line)
+            if m:
+                init_url = urllib.parse.urljoin(current, html.unescape(m.group(1)))
+                _, status = fetch(init_url, binary=True)
+                if status not in ('HTTP200', 'HTTP206'):
+                    return False, '初始化分片:' + status
+    segments = []
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not line.startswith('#'):
+            segments.append(urllib.parse.urljoin(current, line))
+            if len(segments) >= 2:
+                break
+    if not segments:
+        return False, '媒体列表无分片'
+    for index, segment in enumerate(segments, 1):
+        _, status = fetch(segment, binary=True)
+        if status not in ('HTTP200', 'HTTP206'):
+            return False, '分片%d:%s' % (index, status)
+    return True, '分片可读取'
 
 class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v26（一键全面诊断）'
+        return 'Pornhub v26（分片410自动修复）'
 
     def safe_link(self, name, target):
         # FongMi link expects a target dictionary, not a plain string.
@@ -1193,14 +992,10 @@ class Spider(BaseSpider):
             urls = ['自动$' + make_play_id(url, 'auto', select_hls(media, 'auto'), ordered_hls(media, 'auto'))]
             urls += [str(q) + 'P$' + make_play_id(url, str(q), select_hls(media, str(q)), ordered_hls(media, str(q)))
                      for q in sorted(set(d['quality'] for d in media if d['quality'] and not d['master']), reverse=True)]
-            # Dedicated diagnostic entry: only probes when user selects it.
-            urls.append('🔎诊断HLS$' + make_play_id(url, 'diagnose',
-                       select_hls(media, 'auto'), ordered_hls(media, 'auto')))
-            urls.append('🧪一键全面诊断$' + make_play_id(url, 'full-diagnose', select_hls(media, 'auto')))
             if not media:
                 urls.append('网页回退$' + urllib.parse.quote(url, safe=''))
             return {'list': [{'vod_id': url, 'vod_name': title, 'vod_pic': pic,
-                              'vod_content': desc + '\n测试：点击 🔎诊断HLS，对比首分片同地址连续两次请求结果、CDN及签名剩余时间。', 'vod_play_from': '实时HLS' if media else '网页回退',
+                              'vod_content': desc, 'vod_play_from': '实时HLS' if media else '网页回退',
                               'vod_play_url': '#'.join(urls)}]}
         except Exception as exc:
             # A broken metadata parser must not prevent opening a video page.
@@ -1222,24 +1017,6 @@ class Spider(BaseSpider):
                     not urllib.parse.parse_qs(parsed.query).get('viewkey')):
                 return {'parse': 0, 'url': '', 'msg': '无效视频页面'}
 
-            if quality == 'full-diagnose':
-                report = full_hls_diagnostic(page, data.get('hls') or '')
-                return {'parse': 0, 'url': '', 'msg': report}
-
-            if quality == 'diagnose':
-                candidates = [data.get('hls') or ''] + (data.get('alternatives') or [])
-                candidates = [u for u in dict.fromkeys(candidates) if isinstance(u, str) and u]
-                if not candidates:
-                    try:
-                        candidates = ordered_hls(media_definitions(get(page)), 'auto')
-                    except Exception as exc:
-                        return {'parse': 0, 'url': '', 'msg': '网页请求: ' + type(exc).__name__ +
-                                (' HTTP ' + str(exc.code) if isinstance(exc, urllib.error.HTTPError) else '')}
-                reports = []
-                for i, candidate in enumerate(candidates[:3]):
-                    reports.append('源%d: %s' % (i+1, diagnose_compare(candidate, page)))
-                return {'parse': 0, 'url': '', 'msg': '\n'.join(reports) if reports else '未找到HLS地址'}
-
             headers = {'User-Agent': HEADERS['User-Agent'], 'Referer': page,
                        'Origin': parsed.scheme + '://' + parsed.netloc}
             initial = data.get('hls') or ''
@@ -1252,7 +1029,7 @@ class Spider(BaseSpider):
                 if not hls_is_fresh(url) or url in seen:
                     continue
                 seen.add(url)
-                if hls_probe(url, page):
+                if hls_probe(url, page)[0]:
                     return {'parse': 0, 'url': url, 'header': headers}
 
             # Only refresh HTML after the previously extracted URLs fail.
@@ -1262,9 +1039,9 @@ class Spider(BaseSpider):
                 if url in seen or not hls_is_fresh(url):
                     continue
                 seen.add(url)
-                if hls_probe(url, page):
+                if hls_probe(url, page)[0]:
                     return {'parse': 0, 'url': url, 'header': headers}
             return {'parse': 0, 'url': '',
-                    'msg': 'HLS 列表不可访问（可能为 HTTP 410/403 或网络错误），已尝试备用源'}
+                    'msg': '所有候选HLS的媒体分片均无法读取；已尝试重新获取网页和备用源'}
         except Exception as exc:
             return {'parse': 0, 'url': '', 'msg': '播放解析失败：' + type(exc).__name__}
