@@ -313,81 +313,118 @@ def match_meta(source, name):
             return props.get('content', '')
     return ''
 
-def media_definitions(source):
-    """Parse player config; include HLS and JSON get_media API candidates."""
+def player_config(source):
+    """Only read the video's own player configuration, never ad/preroll fields."""
     match = re.search(r'var\s+flashvars_\d+\s*=\s*(\{.*?\})\s*;', source, re.S)
     if not match:
-        return []
+        return {}
     try:
         config = json.loads(match.group(1))
+        if str(config.get('video_unavailable', 'false')).lower() == 'true':
+            return {}
+        return config
     except (ValueError, TypeError):
-        return []
-    if str(config.get('video_unavailable', 'false')).lower() == 'true':
-        return []
+        return {}
+
+
+def media_definitions(source):
+    """Expose HLS resolutions only. Do not treat get_media MP4 as verified."""
+    config = player_config(source)
     result, seen = [], set()
     for entry in config.get('mediaDefinitions', []):
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or str(entry.get('format', '')).lower() != 'hls':
             continue
         url = entry.get('videoUrl', '')
-        fmt = str(entry.get('format', '')).lower()
-        if fmt not in ('hls', 'mp4') or not isinstance(url, str):
+        if not isinstance(url, str):
             continue
         url = html.unescape(url.replace('\\/', '/'))
-        if not url.startswith('https://'):
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != 'https' or not parts.path.lower().endswith('.m3u8'):
             continue
-        path = urllib.parse.urlsplit(url).path.lower()
-        if not (path.endswith(('.m3u8', '.mp4')) or '/get_media' in path):
+        quality = str(entry.get('quality') or entry.get('height') or '').strip()
+        if not quality.isdigit() or (quality, url) in seen:
             continue
-        quality = str(entry.get('quality') or 'auto')
-        key = (quality, url)
-        if key not in seen:
-            seen.add(key)
-            result.append((quality, url))
+        seen.add((quality, url))
+        result.append((quality, url))
     return result
 
 
-def resolve_media(url, referer):
-    """get_media may return JSON containing signed MP4 URLs."""
-    if '/get_media' not in urllib.parse.urlsplit(url).path:
-        return [url]
-    req = urllib.request.Request(url, headers={**HEADERS, 'Referer': referer,
-                                               'Accept': 'application/json, */*'})
+def expected_video_duration(source):
+    config = player_config(source)
     try:
-        with urllib.request.urlopen(req, timeout=12) as response:
-            raw = response.read(256 * 1024).decode('utf-8', 'replace')
-        data = json.loads(raw)
-    except Exception:
-        return []
-    found = []
-    def walk(obj):
-        if isinstance(obj, str):
-            if obj.startswith('https://') and re.search(r'\.(?:mp4|m3u8)(?:[?#]|$)', obj, re.I):
-                found.append(obj)
-        elif isinstance(obj, list):
-            for x in obj: walk(x)
-        elif isinstance(obj, dict):
-            for x in obj.values(): walk(x)
-    walk(data)
-    return list(dict.fromkeys(found))
+        value = float(config.get('video_duration', 0))
+        if value > 0:
+            return value
+    except (ValueError, TypeError):
+        pass
+    info = ld_video(source)
+    value = str(info.get('duration') or '')
+    m = re.fullmatch(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?', value, re.I)
+    if m:
+        return float(m.group(1) or 0) * 3600 + float(m.group(2) or 0) * 60 + float(m.group(3) or 0)
+    return 0
 
 
-def check_media(url, referer):
-    """Read only a small initial response, never download the whole movie."""
-    hdr = {**HEADERS, 'Referer': referer, 'Origin': urllib.parse.urlsplit(referer).scheme + '://' + urllib.parse.urlsplit(referer).netloc,
-           'Range': 'bytes=0-4095'}
-    req = urllib.request.Request(url, headers=hdr)
+def fetch_playlist(url, referer):
+    headers = {**HEADERS, 'Referer': referer,
+               'Origin': urllib.parse.urlsplit(referer).scheme + '://' + urllib.parse.urlsplit(referer).netloc,
+               'Accept': 'application/vnd.apple.mpegurl, application/x-mpegURL, */*'}
+    req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=9) as response:
-            status = response.status
+        with urllib.request.urlopen(req, timeout=10) as response:
             mime = (response.headers.get('Content-Type') or '').lower()
-            sample = response.read(4096)
-        if status not in (200, 206):
-            return False
-        if '.m3u8' in urllib.parse.urlsplit(url).path:
-            return b'#EXTM3U' in sample[:1024] or 'mpegurl' in mime
-        return 'text/html' not in mime and 'application/json' not in mime
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+            raw = response.read(1024 * 1024)
+        content = raw.decode('utf-8-sig', 'replace')
+        if not content.lstrip().startswith('#EXTM3U') or 'text/html' in mime:
+            return ''
+        return content
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return ''
+
+
+def hls_duration(url, referer, depth=0):
+    """Return duration of a media playlist; None means unverified."""
+    if depth > 3:
+        return None
+    content = fetch_playlist(url, referer)
+    if not content:
+        return None
+    segments = re.findall(r'^#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)', content, re.M)
+    if segments:
+        # A live/partial playlist is not proof of the complete movie.
+        if '#EXT-X-ENDLIST' not in content:
+            return None
+        return sum(float(x) for x in segments)
+    if '#EXT-X-STREAM-INF' not in content:
+        return None
+    lines = content.splitlines()
+    children = []
+    for i, line in enumerate(lines):
+        if not line.startswith('#EXT-X-STREAM-INF'):
+            continue
+        for candidate in lines[i + 1:]:
+            candidate = candidate.strip()
+            if not candidate:
+                continue
+            if not candidate.startswith('#'):
+                children.append(urllib.parse.urljoin(url, candidate))
+            break
+    for child in children[:4]:
+        duration = hls_duration(child, referer, depth + 1)
+        if duration is not None:
+            return duration
+    return None
+
+
+def check_full_hls(url, referer, expected):
+    """Reject short ads/previews; fail closed if full duration cannot be verified."""
+    duration = hls_duration(url, referer)
+    if duration is None or duration < 30:
         return False
+    if expected >= 60:
+        # Permit minor rounding differences, not a 15-second preview.
+        return duration >= expected * 0.85
+    return duration >= max(20, expected * 0.7)
 
 
 def make_play_id(page_url, quality):
@@ -493,22 +530,25 @@ class Spider(BaseSpider):
         try:
             data = json.loads(value)
             page = data.get('page', '')
-            quality = str(data.get('quality', ''))
+            quality = str(data.get('quality', '')).replace('P', '').strip()
             if not page or 'view_video.php' not in page:
                 return {'parse': 1, 'url': page or value}
-            # Request a fresh signed URL at the instant the player opens.
             source = get(page)
+            expected = expected_video_duration(source)
             choices = media_definitions(source)
-            choices.sort(key=lambda x: (x[0] != quality, x[0] == 'auto'))
-            for q, raw_url in choices:
-                for media_url in resolve_media(raw_url, page):
-                    if check_media(media_url, page):
-                        return {'parse': 0, 'url': media_url, 'header': {
-                            'User-Agent': HEADERS['User-Agent'],
-                            'Referer': page,
-                            'Origin': urllib.parse.urlsplit(page).scheme + '://' + urllib.parse.urlsplit(page).netloc,
-                        }}
-            # Do not pass a known-bad CDN URL to FongMi.
+            # Never silently switch quality or use a preview/advertisement MP4.
+            if quality.isdigit():
+                choices = [(q, u) for q, u in choices if q == quality]
+            else:
+                choices.sort(key=lambda x: int(x[0]), reverse=True)
+            for q, media_url in choices:
+                if check_full_hls(media_url, page, expected):
+                    return {'parse': 0, 'url': media_url, 'header': {
+                        'User-Agent': HEADERS['User-Agent'],
+                        'Referer': page,
+                        'Origin': urllib.parse.urlsplit(page).scheme + '://' + urllib.parse.urlsplit(page).netloc,
+                    }}
+            # No verified full stream: return webpage rather than a wrong short clip.
             return {'parse': 1, 'url': page}
         except (ValueError, TypeError):
             return {'parse': 1, 'url': value}
