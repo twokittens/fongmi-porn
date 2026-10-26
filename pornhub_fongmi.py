@@ -10,7 +10,6 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import time
-import hashlib
 from html.parser import HTMLParser
 from base.spider import Spider as BaseSpider
 
@@ -913,10 +912,7 @@ class Spider(BaseSpider):
                               'vod_play_from': '实时HLS',
                               'vod_play_url': '自动$' + make_play_id(fallback_url, 'auto')}]} 
     def playerContent(self, flag, id, vipFlags=None):
-        """Diagnostic: distinguish missing HLS from a URL handed to MPV."""
-        def log(message):
-            print('[PH_PLAY_DIAG] ' + message, flush=True)
-
+        """Fast path: reuse freshly parsed HLS; refresh only if expired/absent."""
         try:
             data = json.loads(urllib.parse.unquote(str(id)))
             page = str(data.get('page') or '')
@@ -926,37 +922,19 @@ class Spider(BaseSpider):
                     ('cn.pornhub.com', 'www.pornhub.com', 'pornhub.com') or
                     parsed.path != '/view_video.php' or
                     not urllib.parse.parse_qs(parsed.query).get('viewkey')):
-                log('RESULT=NO_URL reason=invalid_page')
-                return {'parse': 0, 'url': '', 'msg': '未获取到播放地址：无效视频页面'}
+                return {'parse': 0, 'url': '', 'msg': '无效视频页面'}
 
             media_url = str(data.get('hls') or '')
-            cached = usable_hls(media_url, data.get('created'))
-            log('quality=%s cached_present=%s cached_usable=%s' %
-                (quality, bool(media_url), cached))
-            if not cached:
-                log('refreshing_video_page')
+            if not usable_hls(media_url, data.get('created')):
                 source = get(page)
                 definitions = ordered_media(media_definitions(source), quality)
-                log('hls_candidates=%d' % len(definitions))
                 if not definitions:
-                    log('RESULT=NO_URL reason=no_hls_candidates')
-                    return {'parse': 0, 'url': '', 'msg': '未获取到 HLS 播放地址（网页未提供可用候选）'}
+                    return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
                 media_url = definitions[0]['url']
-
-            url_parts = urllib.parse.urlsplit(media_url)
-            if url_parts.scheme != 'https' or not url_parts.netloc or not url_parts.path.lower().endswith('.m3u8'):
-                log('RESULT=NO_URL reason=invalid_hls_url')
-                return {'parse': 0, 'url': '', 'msg': '未获取到有效的 HLS 播放地址'}
-
-            # Fingerprint only: never print full signed CDN URLs or query tokens.
-            fingerprint = hashlib.sha256(media_url.encode('utf-8')).hexdigest()[:12]
-            log('RESULT=URL_RETURNED cdn=%s quality=%s source=%s url_hash=%s ua=WindowsChrome124 referer=video_page' %
-                (url_parts.hostname, quality, 'cache' if cached else 'refreshed', fingerprint))
             return {'parse': 0, 'url': media_url, 'header': {
                 'User-Agent': HEADERS['User-Agent'],
                 'Referer': page,
                 'Origin': parsed.scheme + '://' + parsed.netloc,
             }}
         except Exception as exc:
-            log('RESULT=NO_URL exception=%s' % type(exc).__name__)
-            return {'parse': 0, 'url': '', 'msg': '未获取到播放地址：' + type(exc).__name__}
+            return {'parse': 0, 'url': '', 'msg': '播放解析失败：' + type(exc).__name__}
