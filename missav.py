@@ -1197,7 +1197,7 @@ class Spider(BaseSpider):
         metadata_rows.extend(extra_rows)
         if director_links:
             metadata_rows.append('导演：' + '、'.join(director_links))
-        metadata_rows.append(recommend_link)
+        # Experiment: put recommendation in the native remarks area, not synopsis.
         return {'list': [{
             'vod_id': vid,
             'vod_name': name,
@@ -1210,6 +1210,7 @@ class Spider(BaseSpider):
             'vod_year': '',
             'vod_pubdate': '',
             'vod_content': '\n'.join(filter(None, metadata_rows)),
+            'vod_remarks': recommend_link,
             'vod_play_from': '$$$'.join(label for label, _ in groups),
             'vod_play_url': '$$$'.join(items for _, items in groups)
         }]}
