@@ -3,6 +3,7 @@
 import re
 import html
 import json
+import io
 import urllib.request
 import urllib.error
 from urllib.parse import urljoin, urlparse, quote, urlencode, parse_qs, unquote, urlsplit, urlunsplit, parse_qsl
@@ -327,6 +328,74 @@ class PageParser(HTMLParser):
             self.cards.append(self.stack.pop())
 
 
+
+def video_duration(item):
+    """Read a visible duration or explicit duration attribute on the video card."""
+    image = item.get('img') or {}
+    for key in ('data-duration', 'duration', 'data-video-duration'):
+        raw = str(image.get(key) or '').strip()
+        if raw:
+            if re.fullmatch(r'\d{1,2}:\d{2}(?::\d{2})?', raw):
+                return raw
+            if raw.isdigit() and int(raw) >= 60:
+                seconds = int(raw)
+                return '%d:%02d' % (seconds // 60, seconds % 60)
+    text = ' '.join(item.get('text') or [])
+    # Prefer clock-shaped timestamps; avoid matching numeric video identifiers.
+    matches = re.findall(r'(?<![\d:])(\d{1,2}:\d{2}(?::\d{2})?)(?![\d:])', text)
+    for value in reversed(matches):
+        parts = [int(x) for x in value.split(':')]
+        if len(parts) == 2 and parts[1] < 60:
+            return value
+        if len(parts) == 3 and parts[1] < 60 and parts[2] < 60:
+            return value
+    return ''
+
+
+def overlay_poster(image_bytes, code, duration):
+    """Composite two labels onto a JPEG/PNG poster (requires Pillow in Python module)."""
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    w, h = img.size
+    font_size = max(13, min(32, int(w * 0.048)))
+    font = None
+    for path in ('/system/fonts/Roboto-Bold.ttf', '/system/fonts/NotoSansCJK-Regular.ttc',
+                 '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'):
+        try:
+            font = ImageFont.truetype(path, font_size)
+            break
+        except Exception:
+            pass
+    if font is None:
+        font = ImageFont.load_default()
+    draw = ImageDraw.Draw(img)
+    margin = max(6, int(w * 0.018))
+    pad = max(4, int(font_size * 0.30))
+
+    def label(text, right=False, bottom=False):
+        if not text:
+            return
+        bounds = draw.textbbox((0, 0), text, font=font)
+        tw, th = bounds[2] - bounds[0], bounds[3] - bounds[1]
+        x = w - margin - tw - 2 * pad if right else margin
+        y = h - margin - th - 2 * pad if bottom else margin
+        draw.rounded_rectangle((x, y, x + tw + 2 * pad, y + th + 2 * pad),
+                               radius=max(3, pad), fill=(0, 0, 0))
+        draw.text((x + pad - bounds[0], y + pad - bounds[1]),
+                  text, font=font, fill='white')
+    label(code)
+    label(duration, right=True, bottom=True)
+    out = io.BytesIO()
+    img.save(out, format='JPEG', quality=86)
+    return out.getvalue()
+
+
+def poster_code(url):
+    slug = urlsplit(url).path.rstrip('/').split('/')[-1]
+    slug = re.sub(r'(?i)-(?:uncensored-leak|chinese-subtitle|english-subtitle)$', '', slug)
+    return slug.upper()[:36]
+
+
 def parse_videos(source):
     parser = PageParser()
     parser.feed(source)
@@ -348,8 +417,9 @@ def parse_videos(source):
         seen.add(url)
         result.append({'vod_id': url, 'vod_name': name,
                        'vod_pic': absolute(pic) if pic else '',
-                       'vod_remarks': code.upper(),
-                       'style': {'type': 'rect', 'ratio': 1.78}})
+                       'vod_remarks': video_duration(item),
+                       'style': {'type': 'rect', 'ratio': 1.78},
+                       '_poster_code': poster_code(url)})
     return result, parser
 
 
@@ -556,6 +626,44 @@ class Spider(BaseSpider):
             except Exception:
                 pass
 
+    def _poster_cards(self, cards):
+        for card in cards:
+            code = card.pop('_poster_code', '')
+            pic = card.get('vod_pic', '')
+            duration = card.get('vod_remarks', '')
+            if not (pic and (code or duration)):
+                continue
+            try:
+                card['vod_pic'] = self.getProxyUrl({
+                    'type': 'poster', 'url': pic, 'code': code, 'duration': duration
+                })
+                # Labels are now baked into image, prevent duplicate native badge.
+                card['vod_remarks'] = ''
+            except Exception:
+                # Proxy unavailable: preserve original cover and native duration.
+                pass
+        return cards
+
+    def localProxy(self, params):
+        if str(params.get('type', '')) != 'poster':
+            return [404, 'text/plain', 'Not found']
+        url = str(params.get('url') or '')
+        if not url.startswith(('https://', 'http://')):
+            return [400, 'text/plain', 'Invalid image URL']
+        try:
+            request = urllib.request.Request(url, headers={
+                'User-Agent': UA, 'Referer': HOST + '/'
+            })
+            with urllib.request.urlopen(request, timeout=12) as response:
+                data = response.read(6 * 1024 * 1024 + 1)
+            if len(data) > 6 * 1024 * 1024:
+                return [413, 'text/plain', 'Image too large']
+            result = overlay_poster(data, str(params.get('code') or '')[:36],
+                                    str(params.get('duration') or '')[:12])
+            return [200, 'image/jpeg', result, {'Cache-Control': 'public, max-age=3600'}]
+        except Exception:
+            return [502, 'text/plain', 'Poster overlay unavailable']
+
     def getName(self):
         return 'MissAV Python'
 
@@ -637,6 +745,7 @@ class Spider(BaseSpider):
                     'list': []}
         try:
             videos, parser = parse_videos(source)
+            videos = self._poster_cards(videos)
         except Exception as error:
             self.last = 'HTML解析异常: ' + str(error)
             return {'page': page, 'pagecount': page, 'limit': 20, 'total': page * 20,
@@ -649,6 +758,7 @@ class Spider(BaseSpider):
                 absolute(path))
             if first_status == 200 and not first_challenge:
                 first_videos, _ = parse_videos(first_source)
+                first_videos = self._poster_cards(first_videos)
                 if first_videos and [v['vod_id'] for v in first_videos[:8]] == [
                         v['vod_id'] for v in videos[:8]]:
                     videos = []
@@ -730,6 +840,7 @@ class Spider(BaseSpider):
                 break
             try:
                 page_items, _ = parse_videos(body)
+                page_items = self._poster_cards(page_items)
                 page_actresses = parse_search_actresses(body)
             except Exception:
                 break
@@ -780,6 +891,7 @@ class Spider(BaseSpider):
                 return {'list': []}
             status, body, blocked = self._request(directory_url)
             videos, _ = parse_videos(body) if status == 200 and not blocked else ([], None)
+            videos = self._poster_cards(videos)
             title = unquote(urlsplit(directory_url).path.rstrip('/').split('/')[-1])
             # FongMi treats directory cards as video details. Present their first
             # page as a playable episode list, without changing the client.
@@ -807,6 +919,7 @@ class Spider(BaseSpider):
                 '/cn/search/' + quote(code, safe=''))
             if search_status == 200 and not search_blocked:
                 search_items, _ = parse_videos(search_html)
+                search_items = self._poster_cards(search_items)
                 for item in search_items:
                     url = item['vod_id']
                     other_code, _ = version_info(url)
