@@ -11,21 +11,22 @@ from base.spider import Spider as BaseSpider
 
 HOST = 'https://missav.ai'
 CATEGORIES = [
-    {'type_id': '/dm539/cn/new', 'type_name': '最新更新'},
-    {'type_id': '/dm635/cn/release', 'type_name': '新作上市'},
-    {'type_id': '/dm278/cn/chinese-subtitle', 'type_name': '中文字幕'},
-    {'type_id': '/dm817/cn/uncensored-leak', 'type_name': '无码流出'},
-    {'type_id': '/cn/actresses', 'type_name': '女优一览', 'type_flag': 1},
-    {'type_id': '/cn/actresses/ranking', 'type_name': '女优排行', 'type_flag': 1},
-    {'type_id': '/cn/genres', 'type_name': '类型', 'type_flag': 1},
-    {'type_id': '/cn/makers', 'type_name': '发行商', 'type_flag': 1},
     {'type_id': '/dm301/cn/today-hot', 'type_name': '今日热门'},
     {'type_id': '/dm170/cn/weekly-hot', 'type_name': '本周热门'},
-    {'type_id': '/dm273/cn/monthly-hot', 'type_name': '本月热门'},
+    {'type_id': '/dm273/cn/monthly-hot', 'type_name': '本月热门'},    
+    {'type_id': '/dm817/cn/uncensored-leak', 'type_name': '无码流出'},
+    {'type_id': '/dm278/cn/chinese-subtitle', 'type_name': '中文字幕'},
+    {'type_id': '/dm539/cn/new', 'type_name': '最新更新'},
+    {'type_id': '/dm635/cn/release', 'type_name': '新作上市'},
+    {'type_id': '/dm63/cn/madou', 'type_name': '麻豆传媒'},
+    {'type_id': '/cn/klive', 'type_name': '韩国直播'},
+    {'type_id': '/cn/clive', 'type_name': '中国直播'},
     {'type_id': '/dm597/cn/fc2', 'type_name': 'FC2'},
     {'type_id': '/dm2208642/cn/heyzo', 'type_name': 'HEYZO'},
     {'type_id': '/dm42/cn/tokyohot', 'type_name': '东京热'},
     {'type_id': '/dm4551174/cn/1pondo', 'type_name': '一本道'},
+    {'type_id': '/cn/actresses', 'type_name': '女优一览', 'type_flag': 1},
+    {'type_id': '/cn/actresses/ranking', 'type_name': '女优排行', 'type_flag': 1},
     {'type_id': '/dm6840521/cn/caribbeancom', 'type_name': 'Caribbeancom'},
     {'type_id': '/dm91887/cn/caribbeancompr', 'type_name': 'Caribbeancompr'},
     {'type_id': '/dm6238682/cn/10musume', 'type_name': '10musume'},
@@ -35,9 +36,8 @@ CATEGORIES = [
     {'type_id': '/dm37/cn/marriedslash', 'type_name': '人妻斩'},
     {'type_id': '/dm33/cn/naughty4610', 'type_name': '顽皮4160'},
     {'type_id': '/dm37/cn/naughty0930', 'type_name': '顽皮0930'},
-    {'type_id': '/dm63/cn/madou', 'type_name': '麻豆传媒'},
-    {'type_id': '/cn/klive', 'type_name': '韩国直播'},
-    {'type_id': '/cn/clive', 'type_name': '中国直播'},
+    {'type_id': '/cn/genres', 'type_name': '类型', 'type_flag': 1},
+    {'type_id': '/cn/makers', 'type_name': '发行商', 'type_flag': 1},
 ]
 SPECIAL_PATHS = ('/cn/actresses', '/cn/actresses/ranking', '/cn/genres', '/cn/makers')
 
@@ -146,6 +146,59 @@ def parse_directory(source, kind):
             # FongMi oval cards may display remarks instead of the main name.
             'vod_remarks': name if actress else (entry['count'] + ' 部影片' if entry['count'] else '')
         })
+    return result
+
+
+def parse_search_actresses(source):
+    """Only include actress links actually present in the returned search HTML."""
+    class ActressLinks(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.active = []
+            self.records = []
+
+        def handle_starttag(self, tag, attrs):
+            a = dict(attrs)
+            if tag == 'a':
+                href = a.get('href', '')
+                path = urlsplit(absolute(href)).path.rstrip('/')
+                ok = bool(re.fullmatch(r'(?:/dm\d+)?/cn/actresses/[^/]+', path, re.I))
+                self.active.append({'href': href, 'name': a.get('title', ''),
+                                    'pic': '', 'text': [], 'ok': ok})
+            elif tag == 'img' and self.active and self.active[-1]['ok']:
+                card = self.active[-1]
+                card['name'] = card['name'] or a.get('alt', '')
+                for key in ('data-src', 'data-original', 'data-lazy-src', 'src'):
+                    pic = a.get(key, '')
+                    if pic and not pic.startswith(('data:', 'blob:')):
+                        card['pic'] = absolute(pic)
+                        break
+
+        def handle_data(self, data):
+            if self.active:
+                self.active[-1]['text'].append(data)
+
+        def handle_endtag(self, tag):
+            if tag == 'a' and self.active:
+                card = self.active.pop()
+                if card['ok']:
+                    self.records.append(card)
+
+    parser = ActressLinks()
+    parser.feed(source)
+    result, seen = [], set()
+    for card in parser.records:
+        url = absolute(card['href'])
+        if url in seen:
+            continue
+        seen.add(url)
+        name = re.sub(r'\s+', ' ', html.unescape(card['name'] or ''.join(card['text']))).strip()
+        if not name:
+            name = unquote(urlsplit(url).path.rstrip('/').split('/')[-1]).replace('-', ' ')
+        result.append({'vod_id': url, 'vod_name': name,
+                       'vod_pic': card['pic'], 'vod_remarks': name,
+                       'vod_tag': 'folder', 'cate': {},
+                       'style': {'type': 'oval', 'ratio': 1.0}})
     return result
 
 
@@ -284,8 +337,8 @@ def parse_videos(source):
         if not valid_video(url) or url in seen:
             continue
         image = item['img'] or {}
-        # Search cards may have a title-only anchor while the poster is a sibling.
-        # A valid video detail URL is sufficient to retain the result.
+        if not image and not item['alt']:
+            continue
         pic = (image.get('data-src') or image.get('data-original') or
                image.get('data-lazy-src') or image.get('src') or '')
         if pic.startswith('data:'):
@@ -296,8 +349,88 @@ def parse_videos(source):
         result.append({'vod_id': url, 'vod_name': name,
                        'vod_pic': absolute(pic) if pic else '',
                        'vod_remarks': code.upper(),
-                       'style': {'type': 'rect', 'ratio': 0.667}})
+                       'style': {'type': 'rect', 'ratio': 1.78}})
     return result, parser
+
+
+def extract_detail_recommendations(source, current_url='', limit=30):
+    """Read only actual rendered recommendation anchors, not JS templates or guesses.
+
+    The fragment after # is a Recombee tracking token; strip it from the video URL.
+    """
+    from html.parser import HTMLParser
+
+    class RecommendationParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.links = []
+            self.active = []
+
+        def handle_starttag(self, tag, attrs):
+            a = dict(attrs)
+            if tag == 'a':
+                href = html.unescape(a.get('href', ''))
+                fragment = urlsplit(href).fragment.lower()
+                # Only recommendations identified by the site's tracking fragment.
+                eligible = any(marker in fragment for marker in (
+                    'watch-next-side', 'watch-next-bottom', 'mobile-watch-next'))
+                self.active.append({'url': href.split('#', 1)[0],
+                                    'eligible': eligible, 'text': [],
+                                    'title': a.get('title', '')})
+            elif tag == 'img' and self.active and self.active[-1]['eligible']:
+                self.active[-1]['title'] = (self.active[-1]['title'] or
+                    a.get('alt', ''))
+
+        def handle_data(self, data):
+            if self.active:
+                self.active[-1]['text'].append(data)
+
+        def handle_endtag(self, tag):
+            if tag == 'a' and self.active:
+                item = self.active.pop()
+                if item['eligible']:
+                    self.links.append(item)
+
+    parser = RecommendationParser()
+    parser.feed(source)
+    found, seen = [], set()
+    current = absolute(current_url).split('#', 1)[0]
+    for item in parser.links:
+        url = absolute(item['url'])
+        if not valid_video(url) or url == current or url in seen:
+            continue
+        seen.add(url)
+        title = re.sub(r'\s+', ' ', item['title'] or ' '.join(item['text'])).strip()
+        if not title:
+            title = unquote(urlsplit(url).path.rstrip('/').split('/')[-1]).upper()
+        found.append({'url': url, 'title': title[:100]})
+        if len(found) >= limit:
+            break
+    return found
+
+
+def extract_detail_actresses(source):
+    """Extract actual actress profile links from the current detail HTML."""
+    matches, seen = [], set()
+    pattern = (r'<a\b(?P<attrs>[^>]*?)\bhref\s*=\s*'
+               r'(?P<q>[\x22\x27])(?P<href>.*?)(?P=q)'
+               r'[^>]*>(?P<body>.*?)</a\s*>')
+    for m in re.finditer(pattern, source, re.I | re.S):
+        url = absolute(m.group('href'))
+        if not re.fullmatch(r'(?:/dm\d+)?/cn/actresses/[^/]+',
+                            urlsplit(url).path.rstrip('/'), re.I):
+            continue
+        if url in seen or urlsplit(url).path.rstrip('/').endswith('/ranking'):
+            continue
+        seen.add(url)
+        body = m.group('body')
+        label = re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]*>', ' ', body))).strip()
+        img = re.search(r'<img\b[^>]*\balt=[\x22\x27]([^\x22\x27]+)', body, re.I)
+        name = label or (html.unescape(img.group(1)) if img else '')
+        if not name:
+            name = unquote(urlsplit(url).path.rstrip('/').split('/')[-1]).replace('-', ' ')
+        matches.append({'name': name[:80], 'url': url})
+    return matches
 
 
 def unpack_player(source):
@@ -487,35 +620,6 @@ def subtitle_items(data):
     return []
 
 
-def detail_actresses_and_related(source, current_url):
-    """Read actress links and server-rendered recommendations from detail HTML."""
-    actresses = []
-    seen = set()
-    pattern = r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a\s*>'
-    for match in re.finditer(pattern, source, re.I | re.S):
-        url = absolute(html.unescape(match.group(1)))
-        if not re.search(r'/(?:dm\d+/)?cn/actresses/[^/?#]+', urlsplit(url).path, re.I):
-            continue
-        if urlsplit(url).path.rstrip('/').endswith('/actresses/ranking'):
-            continue
-        if url in seen:
-            continue
-        body = match.group(2)
-        name = html.unescape(re.sub(r'<[^>]*>', ' ', body)).strip()
-        name = re.sub(r'\s+', ' ', name)
-        if not name:
-            name = unquote(urlsplit(url).path.rstrip('/').split('/')[-1])
-        actresses.append({'name': name, 'url': url})
-        seen.add(url)
-    # MissAV's actual recommendations use JS Recombee after page load.
-    # Do not mistake placeholders or other unrelated links for recommendations.
-    related = []
-    if 'recommendItems' not in source:
-        cards, _ = parse_videos(source)
-        related = [v for v in cards if v.get('vod_id') != current_url][:24]
-    return actresses[:12], related
-
-
 class Spider(BaseSpider):
     def init(self, extend=''):
         self.last = '未请求'
@@ -544,19 +648,25 @@ class Spider(BaseSpider):
     def _request(self, path):
         url = absolute(path)
         self.last_url = url
-        headers = {'User-Agent': UA, 'Referer': HOST + '/',
-                   'Accept-Language': 'zh-CN,zh;q=0.9',
-                   'Accept': 'text/html,application/xhtml+xml,*/*'}
-        # Keep the working FongMi network request and cookie handling.
-        # Python urllib.request would not share the WebView cookie jar.
+        try:
+            ua = self.net.getUserAgent() or UA
+        except Exception:
+            ua = UA
+        headers = {
+            'User-Agent': ua,
+            'Referer': HOST + '/',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,*/*',
+        }
         try:
             response = self.net.req(url, {
                 'method': 'GET', 'timeout': 20000,
                 'cookie': True, 'headers': headers
             })
             if isinstance(response, str):
-                import json
                 response = json.loads(response)
+            if not isinstance(response, dict):
+                raise TypeError('net.req 返回类型: ' + type(response).__name__)
             status = int(response.get('code', response.get('status', 0)) or 0)
             content = response.get('content', '') or ''
             if isinstance(content, bytes):
@@ -566,9 +676,9 @@ class Spider(BaseSpider):
         except Exception as error:
             self.last = '请求异常: ' + str(error)
             return 0, '', False
-        # A successful HTML page can contain Cloudflare strings in unrelated scripts.
-        # Only mark a 200 response as a challenge when a clear challenge-page
-        # signature is present and no actual video cards can be parsed.
+
+        # Only a challenge signature in the returned page can confirm a
+        # 200-response challenge. A 403 alone does not prove Cloudflare.
         signature = bool(re.search(
             r'<title[^>]*>\s*Just a moment\s*\.\.\.|'
             r'<form[^>]+(?:challenge-form|id=[\"\']challenge-form)|'
@@ -582,8 +692,13 @@ class Spider(BaseSpider):
             except Exception:
                 challenge = True
         title_match = re.search(r'<title[^>]*>([\s\S]*?)</title>', content, re.I)
-        self.last_title = html.unescape(re.sub(r'<[^>]+>', '', title_match.group(1))).strip()[:100] if title_match else '(无 title)'
-        self.last_preview = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', content[:3000])).strip()[:180]
+        self.last_title = (
+            html.unescape(re.sub(r'<[^>]+>', '', title_match.group(1))).strip()[:100]
+            if title_match else '(无 title)'
+        )
+        self.last_preview = re.sub(
+            r'\s+', ' ', re.sub(r'<[^>]+>', ' ', content[:3000])
+        ).strip()[:180]
         self.last = 'HTTP {} | 长度 {} | 验证页 {} | title={} | {}'.format(
             status, len(content), '是' if challenge else '否', self.last_title, url)
         return status, content, challenge
@@ -598,12 +713,14 @@ class Spider(BaseSpider):
             target += ('&' if '?' in target else '?') + 'page=' + str(page)
         status, source, challenge = self._request(target)
         if status != 200 or challenge or not source:
-            return {'page': page, 'pagecount': page, 'limit': 20, 'total': page * 20, 'list': []}
+            return {'page': page, 'pagecount': page, 'limit': 20, 'total': page * 20,
+                    'list': []}
         try:
             videos, parser = parse_videos(source)
         except Exception as error:
             self.last = 'HTML解析异常: ' + str(error)
-            return {'page': page, 'pagecount': page, 'limit': 20, 'total': page * 20, 'list': []}
+            return {'page': page, 'pagecount': page, 'limit': 20, 'total': page * 20,
+                    'list': []}
         # FongMi will not request the next search page when pagecount <= page.
         # MissAV search pages can omit a next link, even for nonempty results.
         # Advertise more pages while results exist; stop on empty or repeated pages.
@@ -682,6 +799,7 @@ class Spider(BaseSpider):
         batch_size = 3
         first_site_page = (client_page - 1) * batch_size + 1
         items, seen = [], set()
+        actresses, seen_actresses = [], set()
         completed_batch = False
         for site_page in range(first_site_page, first_site_page + batch_size):
             url = absolute(target)
@@ -692,8 +810,13 @@ class Spider(BaseSpider):
                 break
             try:
                 page_items, _ = parse_videos(body)
+                page_actresses = parse_search_actresses(body)
             except Exception:
                 break
+            for actress in page_actresses:
+                if actress['vod_id'] not in seen_actresses:
+                    seen_actresses.add(actress['vod_id'])
+                    actresses.append(actress)
             fresh = 0
             for item in page_items:
                 if item['vod_id'] not in seen:
@@ -704,9 +827,12 @@ class Spider(BaseSpider):
                 break
             if site_page == first_site_page + batch_size - 1:
                 completed_batch = True
-        n = len(items)
-        return {'list': items, 'page': client_page,
-                'pagecount': client_page + 1 if n and completed_batch else client_page,
+        # Put clickable actress portraits ahead of landscape video cards.
+        # Keep search-page pagination driven by videos, not by repeated portraits.
+        results = actresses + items
+        n = len(results)
+        return {'list': results, 'page': client_page,
+                'pagecount': client_page + 1 if items and completed_batch else client_page,
                 'limit': n or 20,
                 'total': (client_page + 1) * n if n else client_page * 20}
 
@@ -744,8 +870,6 @@ class Spider(BaseSpider):
                               'vod_content': '该目录第一页的影片；选择条目直接播放。',
                               'vod_play_from': '相关影片' if entries else '',
                               'vod_play_url': '#'.join(entries)}]}
-        if str(vid).startswith('missav-diagnostic://'):
-            return {'list': []}
         status, source, challenge = self._request(vid)
         if status != 200 or challenge:
             return {'list': [{'vod_id': vid, 'vod_name': '详情请求失败',
@@ -755,7 +879,6 @@ class Spider(BaseSpider):
         name = (' '.join(parser.title_text).strip() or
                 parser.meta.get('og:title') or vid.rsplit('/', 1)[-1])
         code, _ = version_info(vid)
-        actresses, related = detail_actresses_and_related(source, vid)
         # Discover real same-code variants via the verified /cn/search/<code> page.
         # Do not guess /dmNN/ paths: they can differ between versions.
         candidates = [vid]
@@ -811,25 +934,33 @@ class Spider(BaseSpider):
             if entries:
                 groups.append((label, '#'.join(entries)))
                 seen_versions.add(label)
+        # Only real recommendation anchors already present in this response.
+        # In many MissAV pages Recombee populates them later via JavaScript;
+        # those items cannot be inferred from a static HTML response.
+        related = extract_detail_recommendations(source, vid)
         if related:
-            recommended = ['{}$missavpage:{}'.format(
-                re.sub(r'[$#]', ' ', item['vod_name'])[:70],
-                quote(item['vod_id'], safe='')) for item in related]
-            groups.append(('MissAV相关推荐', '#'.join(recommended)))
-        actress_names = '、'.join(item['name'] for item in actresses)
-        actress_info = ('\n女优：' + actress_names) if actress_names else ''
-        if actresses:
-            actress_info += '\n女优作品页：' + '、'.join(
-                item['name'] + ' ' + item['url'] for item in actresses)
-        if 'recommendItems' in source and not related:
-            actress_info += '\n相关推荐：该页面通过 JavaScript 动态加载，原始 HTML 不包含推荐结果。'
+            related_entries = []
+            for item in related:
+                safe_title = re.sub(r'[$#]', ' ', item['title'])
+                related_entries.append('{}$missavpage:{}'.format(
+                    safe_title, quote(item['url'], safe='')))
+            groups.append(('网页相关推荐', '#'.join(related_entries)))
+        actresses = extract_detail_actresses(source)
+        actress_names = '、'.join(a['name'] for a in actresses)
+        actress_links = '\n'.join('{}：{}'.format(a['name'], a['url'])
+                                   for a in actresses)
+        content = parser.meta.get('description', '')
+        if actress_links:
+            content += '\n关联女优作品页：\n' + actress_links
+        if not related:
+            content += '\n相关推荐：网页源码未包含实际推荐条目（可能由 JavaScript 异步加载）。'
+        content += ('\n可选版本：' + '、'.join(label for label, _ in groups)
+                    if groups else '\n没有解析出有效播放线路')
         return {'list': [{
             'vod_id': vid, 'vod_name': name,
-            'vod_actor': actress_names,
             'vod_pic': absolute(parser.meta.get('og:image')) if parser.meta.get('og:image') else '',
-            'vod_content': parser.meta.get('description', '') + actress_info +
-                           ('\n可选版本：' + '、'.join(label for label, _ in groups)
-                            if groups else '\n没有解析出有效播放线路'),
+            'vod_actor': actress_names,
+            'vod_content': content,
             'vod_play_from': '$$$'.join(label for label, _ in groups),
             'vod_play_url': '$$$'.join(items for _, items in groups)
         }]}
