@@ -875,15 +875,26 @@ class Spider(BaseSpider):
             if not definitions:
                 return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
             target = quality_number(quality) if quality != 'auto' else 0
-            if target:
-                definitions.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
-                                                 not d['default']))
+            # A quality array represents an HLS master candidate; its maximum
+            # resolution must never be mistaken for a fixed-resolution stream.
+            masters = [d for d in definitions if d['master']]
+            fixed = [d for d in definitions if not d['master'] and d['quality'] > 0]
+            unknown = [d for d in definitions if not d['master'] and not d['quality']]
+            if not target:
+                # Let the player select a rendition from the master playlist.
+                # No preflight: avoid spending signed-URL lifetime in Python.
+                candidates = sorted(masters, key=lambda d: (not d['default'], -d['quality']))
+                candidates += sorted(fixed, key=lambda d: (not d['default'], abs(d['quality'] - 720)))
+                candidates += unknown
             else:
-                definitions.sort(key=lambda d: (not d['default'], d['master'],
-                                                 abs(d['quality'] - 720) if d['quality'] else 9999))
-            # CDN signed URLs are time-sensitive. No preflight GET, which can
-            # consume the validity window before FongMi opens the manifest.
-            media_url = definitions[0]['url']
+                # A fixed-quality selection must not silently resolve to the
+                # same master URL used by Auto when a matching fixed stream exists.
+                candidates = sorted(fixed, key=lambda d: (abs(d['quality'] - target), not d['default']))
+                candidates += sorted(masters, key=lambda d: not d['default'])
+                candidates += unknown
+            if not candidates:
+                return {'parse': 0, 'url': '', 'msg': '没有匹配的 HLS 播放源'}
+            media_url = candidates[0]['url']
             return {'parse': 0, 'url': media_url, 'header': {
                 'User-Agent': HEADERS['User-Agent'],
                 'Referer': page,
