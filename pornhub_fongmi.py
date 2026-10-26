@@ -293,6 +293,61 @@ def parse_pornstars(source):
                        'vod_tag': 'folder', 'style': {'type': 'oval'}})
     return result
 
+class SearchPerformerParser(HTMLParser):
+    """Extract performer profile links from search results, not ranking-only markup."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.items = []
+        self.links = []
+        self.capture = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == 'a':
+            href = a.get('href', '')
+            path = urllib.parse.urlsplit(absolute(href)).path.rstrip('/')
+            if re.fullmatch(r'/(?:pornstar|model)/[^/]+', path, re.I):
+                self.links.append({'url': absolute(href), 'name': a.get('title', ''),
+                                   'image': '', 'text': [], 'depth': 1})
+            elif self.links:
+                self.links[-1]['depth'] += 1
+        if tag == 'img' and self.links:
+            current = self.links[-1]
+            current['image'] = current['image'] or pick_performer_image(a)
+            current['name'] = current['name'] or a.get('alt', '')
+
+    def handle_data(self, data):
+        if self.links:
+            self.links[-1]['text'].append(data)
+
+    def handle_endtag(self, tag):
+        if tag == 'a' and self.links:
+            self.links[-1]['depth'] -= 1
+            if self.links[-1]['depth'] <= 0:
+                self.items.append(self.links.pop())
+
+
+def parse_search_performers(source, keyword=''):
+    parser = SearchPerformerParser()
+    parser.feed(source)
+    results, seen = [], set()
+    term = str(keyword or '').strip().casefold()
+    for item in parser.items:
+        url = item['url']
+        if url in seen:
+            continue
+        slug = urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit('/', 1)[-1]).replace('-', ' ')
+        name = clean(item['name']) or clean(' '.join(item['text'])) or slug
+        # Avoid unrelated navigation links accidentally appearing as search results.
+        if term and term not in (name + ' ' + slug).casefold():
+            continue
+        seen.add(url)
+        results.append({'vod_id': 'pornstar:' + url, 'vod_name': name,
+                        'vod_pic': item['image'], 'vod_remarks': '色情明星',
+                        'vod_tag': 'folder', 'style': {'type': 'oval', 'ratio': 1.0}})
+    return results
+
+
 def ld_video(source):
     for raw in re.findall(r'<script\b[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', source, re.I | re.S):
         try:
@@ -436,7 +491,7 @@ class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v13（真实40条列表解析）'
+        return 'Pornhub v21（视频与明星搜索）'
     def isVideoFormat(self, url):
         return bool(re.search(r'\.(?:mp4|m3u8)(?:[?#]|$)', str(url), re.I))
     def manualVideoCheck(self):
@@ -480,8 +535,31 @@ class Spider(BaseSpider):
         except Exception:
             return {'list': [], 'page': int(pg or 1), 'pagecount': int(pg or 1), 'limit': 0, 'total': 0}
     def searchContent(self, key, quick=False, pg='1'):
-        path = '/video/search?search=' + urllib.parse.quote(str(key))
-        return self.categoryContent(path, pg, False, {})
+        """Search videos and performer profiles; performer cards open video folders."""
+        keyword = str(key or '').strip()
+        if not keyword:
+            return {'list': [], 'page': 1, 'pagecount': 1, 'limit': 0, 'total': 0}
+        try:
+            page = max(1, int(pg))
+        except (TypeError, ValueError):
+            page = 1
+        query = urllib.parse.quote(keyword)
+        video_result = self.categoryContent('/video/search?search=' + query, page, False, {})
+        videos = video_result.get('list', [])
+        performers = []
+        # Pornhub's performer search is separate from the video search.
+        # Show performers on the first page, preserving video pagination.
+        if page == 1:
+            try:
+                performers = parse_search_performers(
+                    get('/pornstars/search?search=' + query), keyword)
+            except Exception:
+                performers = []
+        merged = performers + videos
+        return {'list': merged, 'page': page,
+                'pagecount': video_result.get('pagecount', page + 1 if merged else page),
+                'limit': len(merged),
+                'total': video_result.get('total', 0) + len(performers)}
     def detailContent(self, ids):
         if str(ids[0]).startswith('pornstar:'):
             profile = str(ids[0])[len('pornstar:'):]
