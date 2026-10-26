@@ -1108,18 +1108,12 @@ class Spider(BaseSpider):
                     links.append(display_name)
             return '、'.join(links)
 
-        # Build a single custom metadata block. Each row has uniform spacing.
-        metadata_rows = []
-        def add_metadata(label, value):
-            if value:
-                metadata_rows.append(label + '：' + value)
-        add_metadata('站点', 'MissAV')
-        # Date and code are inserted after release_date is parsed below.
-        add_metadata('女优', '、'.join(actress_links))
+        extra_rows = []
         for label, kind in (('类型', 'genres'), ('系列', 'series'),
                             ('发行商', 'makers'), ('标签', 'labels')):
-            add_metadata(label, clickable_entities(entities[kind]))
-        add_metadata('导演', '、'.join(director_links))
+            values = clickable_entities(entities[kind])
+            if values:
+                extra_rows.append(label + '：' + values)
         # Separate category-style recommendation entry, not a playback line.
         recommend_target = {'id': RECOMMEND_PREFIX + quote(absolute(vid), safe=''),
                             'name': '相关推荐', 'type_flag': 1}
@@ -1138,15 +1132,6 @@ class Spider(BaseSpider):
             if date_match:
                 release_date = '{}-{:02d}-{:02d}'.format(
                     date_match.group(1), int(date_match.group(2)), int(date_match.group(3)))
-        # Put all custom metadata on consistent, separately spaced lines.
-        metadata_rows[1:1] = [
-            '发行日期：' + release_date if release_date else '',
-            '番号：' + code.upper() if code else '',
-            '标题：' + name,
-        ]
-        metadata_rows = [row for row in metadata_rows if row]
-        metadata_rows.append(recommend_link)
-        custom_metadata = '\n\n'.join(metadata_rows)
         # Discover real same-code variants via the verified /cn/search/<code> page.
         # Do not guess /dmNN/ paths: they can differ between versions.
         candidates = [vid]
@@ -1205,12 +1190,14 @@ class Spider(BaseSpider):
         return {'list': [{
             'vod_id': vid, 'vod_name': name,
             'vod_pic': absolute(parser.meta.get('og:image')) if parser.meta.get('og:image') else '',
-            # All metadata is custom-formatted in one native text field.
-            # FongMi may still show its fixed label (演员) for this field.
-            'vod_actor': custom_metadata,
-            'vod_director': '',
-            'vod_pubdate': '',
-            'vod_year': '',
+            # FongMi renders the actor field under its built-in '演员' label;
+            # the Spider API cannot rename that native label to '女优'.
+            'vod_actor': '\n\n'.join(filter(None, ['、'.join(actress_links)] + extra_rows)),
+            # Keep director clickable; put recommendations on the next row,
+            # outside the actress/metadata block and away from playback lines.
+            'vod_director': '\n\n'.join(filter(None, ['、'.join(director_links), recommend_link])),
+            'vod_pubdate': release_date,
+            'vod_year': release_date[:4] if release_date else '',
             'vod_content': parser.meta.get('description', '') +
                            ('\n可选版本：' + '、'.join(label for label, _ in groups)
                             if groups else '\n没有解析出有效播放线路'),
