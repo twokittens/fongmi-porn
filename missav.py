@@ -1203,13 +1203,13 @@ class Spider(BaseSpider):
             'vod_name': name,
             'vod_pic': absolute(parser.meta.get('og:image')) if parser.meta.get('og:image') else '',
             # FongMi's built-in field captions cannot be renamed by a Spider.
-            # Put all custom metadata into one visible field, with single newlines.
-            'vod_actor': '\n'.join(filter(None, metadata_rows)),
+            # Test: move clickable metadata to synopsis, suppress actor field.
+            'vod_actor': '',
             'vod_director': '',
             'vod_area': '',
             'vod_year': '',
             'vod_pubdate': '',
-            'vod_content': '',
+            'vod_content': '\n'.join(filter(None, metadata_rows)),
             'vod_play_from': '$$$'.join(label for label, _ in groups),
             'vod_play_url': '$$$'.join(items for _, items in groups)
         }]}
