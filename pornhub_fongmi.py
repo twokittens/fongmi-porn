@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Pornhub FongMi Python Spider v12 (real profile HTML, public pages only).
+"""Pornhub FongMi Python Spider v26 (real profile HTML, public pages only).
 No login, CAPTCHA, DRM, geo restriction or payment bypass.
 Requires FongMi Python Spider runtime (base.spider).
 """
@@ -98,11 +98,13 @@ class CardParser(HTMLParser):
         self.li_depth = 0
         self.current = None
         self.anchor = None
+        self.reject = False
 
     def handle_starttag(self, tag, attrs):
         d = dict(attrs)
         if tag == 'li':
             if self.current is None:
+                self.reject = bool(re.search(r'playlist|collection|album|channel|compilation', (d.get('class','') + ' ' + d.get('id','') + ' ' + d.get('data-type','')), re.I))
                 self.current = {'href': '', 'title': '', 'image': '', 'text': [], 'duration': '', 'duration_capture': False}
                 self.li_depth = 1
             else:
@@ -111,6 +113,8 @@ class CardParser(HTMLParser):
             return
         if tag == 'a':
             href = d.get('href', '')
+            if re.search(r'/(?:playlist|playlists|album|albums)/', href, re.I):
+                self.reject = True
             if 'view_video.php' in href and 'viewkey=' in href:
                 self.current['href'] = self.current['href'] or href
                 self.current['title'] = self.current['title'] or d.get('title', '')
@@ -139,9 +143,10 @@ class CardParser(HTMLParser):
         if tag == 'li' and self.current is not None:
             self.li_depth -= 1
             if self.li_depth <= 0:
-                if self.current['href']:
+                if self.current['href'] and not self.reject:
                     self.cards.append(self.current)
                 self.current = None
+                self.reject = False
 
 def parse_cards(source):
     p = CardParser()
@@ -149,6 +154,8 @@ def parse_cards(source):
     result, seen = [], set()
     for card in p.cards:
         url = absolute(card['href'])
+        if not re.fullmatch(r'/view_video\.php', urllib.parse.urlsplit(url).path, re.I):
+            continue
         key = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get('viewkey', [''])[0]
         if not key or key in seen:
             continue
@@ -357,6 +364,7 @@ def parse_search_performers(source, keyword=''):
     parser.feed(source)
     results, seen = [], set()
     term = str(keyword or '').strip().casefold()
+    compact_term = re.sub(r'[^\w]+', '', term)
     for item in parser.items:
         url = item['url']
         if url in seen:
@@ -364,7 +372,9 @@ def parse_search_performers(source, keyword=''):
         slug = urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit('/', 1)[-1]).replace('-', ' ')
         name = clean(item['name']) or clean(' '.join(item['text'])) or slug
         # Avoid unrelated navigation links accidentally appearing as search results.
-        if term and term not in (name + ' ' + slug).casefold():
+        candidate = (name + ' ' + slug).casefold()
+        compact_candidate = re.sub(r'[^\w]+', '', candidate)
+        if term and term not in candidate and compact_term not in compact_candidate:
             continue
         seen.add(url)
         results.append({'vod_id': 'pornstar:' + url, 'vod_name': name,
@@ -472,6 +482,8 @@ def search_performer_pages(keyword):
                     found.append(item)
         except Exception:
             continue
+    # When the site returns performer suggestions with spaces, compact matching
+    # is handled by parse_search_performers; this does not fabricate unknown splits.
     return found
 
 def ld_video(source):
