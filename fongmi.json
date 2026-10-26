@@ -45,7 +45,7 @@
   ],
   "sites": [
     {
-      "key": "missav_python_v47",
+      "key": "missav_python_v48",
       "name": "MissAV",
       "type": 3,
       "api": "./missav.py",
