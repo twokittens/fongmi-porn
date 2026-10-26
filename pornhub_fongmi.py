@@ -932,11 +932,126 @@ def diagnose_compare(url, referer):
         result.append('首分片第%d次:%s' % (i+1, status))
     return ' | '.join(result)
 
+
+
+def full_hls_diagnostic(page, initial_url=''):
+    """One-click bounded diagnosis. Does not claim to observe MPV's own requests."""
+    import hashlib
+    import socket
+    from datetime import datetime
+    results = []
+    origin = urllib.parse.urlsplit(page).scheme + '://' + urllib.parse.urlsplit(page).netloc
+
+    def fingerprint(url):
+        p = urllib.parse.urlsplit(url)
+        return (p.hostname or '?') + '/' + hashlib.sha256(p.path.encode()).hexdigest()[:7] + ':' + hashlib.sha256(url.encode()).hexdigest()[:7]
+
+    def expiry(url):
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        for key in ('validto', 'expires', 'expire', 'exp'):
+            if key in q:
+                try:
+                    v = float(q[key][0]); v = v / 1000 if v > 1e12 else v
+                    return str(int(v-time.time())) + 's'
+                except (ValueError, TypeError):
+                    return 'invalid'
+        return '?'
+
+    def request(url, stage, mode='manifest', headers_mode='full'):
+        h = {'User-Agent': HEADERS['User-Agent'], 'Accept': '*/*'}
+        if headers_mode in ('full', 'no-origin'):
+            h['Referer'] = page
+        if headers_mode == 'full':
+            h['Origin'] = origin
+        if mode == 'range':
+            h['Range'] = 'bytes=0-1023'
+        try:
+            req = urllib.request.Request(url, headers=h)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                status = getattr(resp, 'status', 200)
+                mime = (resp.headers.get('Content-Type') or '').lower()
+                body = resp.read(131072 if mode == 'manifest' else 2048)
+                resolved = resp.geturl()
+            if mode == 'manifest' and not body.lstrip().startswith(b'#EXTM3U'):
+                return None, 'HTTP%d 非M3U8' % status, resolved
+            if mode != 'manifest' and ('text/html' in mime or body.lstrip().startswith(b'<!DOCTYPE')):
+                return None, 'HTTP%d HTML' % status, resolved
+            return body.decode('utf-8-sig', 'replace') if mode == 'manifest' else body, 'HTTP%d' % status, resolved
+        except urllib.error.HTTPError as e:
+            return None, 'HTTP%d' % e.code, url
+        except urllib.error.URLError as e:
+            reason = e.reason
+            label = 'timeout' if isinstance(reason, (socket.timeout, TimeoutError)) else type(reason).__name__
+            return None, 'URL/' + label, url
+        except (OSError, ValueError, TimeoutError) as e:
+            return None, type(e).__name__, url
+
+    def uris(manifest):
+        return [line.strip() for line in manifest.splitlines() if line.strip() and not line.lstrip().startswith('#')]
+
+    snapshots = []
+    for idx in range(2):
+        if idx == 0 and initial_url:
+            root = initial_url
+            results.append('A 使用详情页HLS')
+        else:
+            try:
+                start = time.monotonic()
+                source = get(page)
+                defs = media_definitions(source)
+                root = select_hls(defs, 'auto')
+                results.append('%s 网页OK %dms HLS%d' % ('A' if idx == 0 else 'B', int((time.monotonic()-start)*1000), len(defs)))
+            except Exception as e:
+                results.append('%s 网页失败:%s%s' % ('A' if idx == 0 else 'B', type(e).__name__, ' HTTP%d' % e.code if isinstance(e, urllib.error.HTTPError) else ''))
+                continue
+        if not root:
+            results.append('无HLS地址'); continue
+        results.append('主:%s 到期:%s' % (fingerprint(root), expiry(root)))
+        master, status, actual = request(root, 'master')
+        results.append('主列表:' + status)
+        if master is None: continue
+        base = actual
+        if '#EXT-X-STREAM-INF' in master:
+            choices = uris(master)
+            if not choices:
+                results.append('子列表:无URL'); continue
+            child_url = urllib.parse.urljoin(base, choices[0])
+            results.append('子:%s 到期:%s' % (fingerprint(child_url), expiry(child_url)))
+            child, status, base = request(child_url, 'child')
+            results.append('子列表:' + status)
+            if child is None: continue
+            master = child
+        choices = uris(master)
+        if not choices:
+            results.append('分片:无URL'); continue
+        # EXT-X-MAP is important for fragmented MP4: init segment is not the first media URI.
+        map_match = re.search(r'#EXT-X-MAP:.*?URI=[\"\']([^\"\']+)', master)
+        if map_match:
+            init_url = urllib.parse.urljoin(base, map_match.group(1))
+            _, st, _ = request(init_url, 'init', 'range')
+            results.append('初始化分片:' + st)
+        seg = urllib.parse.urljoin(base, choices[0])
+        snapshots.append(seg)
+        results.append('首分片:%s 到期:%s' % (fingerprint(seg), expiry(seg)))
+        for name, mode, header in [('Range+完整头','range','full'),('普通GET+完整头','segment','full'),('Range+无Origin','range','no-origin'),('Range+UA','range','ua')]:
+            _, st, _ = request(seg, name, mode, header)
+            results.append(name+':'+st)
+        if len(choices)>1:
+            seg2 = urllib.parse.urljoin(base, choices[1])
+            _, st, _ = request(seg2, 'second', 'range')
+            results.append('第二分片:'+st)
+    if len(snapshots) == 2:
+        a,b = snapshots
+        pa,pb = urllib.parse.urlsplit(a),urllib.parse.urlsplit(b)
+        results.append('AB首分片:域名%s 路径%s 完整URL%s' % ('同' if pa.hostname==pb.hostname else '异', '同' if pa.path==pb.path else '异', '同' if a==b else '异'))
+    results.append('说明:这是Python网络测试,不等同MPV真实请求')
+    return '\n'.join(results)
+
 class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v26（HLS 分段诊断）'
+        return 'Pornhub v26（一键全面诊断）'
 
     def safe_link(self, name, target):
         # FongMi link expects a target dictionary, not a plain string.
@@ -1081,6 +1196,7 @@ class Spider(BaseSpider):
             # Dedicated diagnostic entry: only probes when user selects it.
             urls.append('🔎诊断HLS$' + make_play_id(url, 'diagnose',
                        select_hls(media, 'auto'), ordered_hls(media, 'auto')))
+            urls.append('🧪一键全面诊断$' + make_play_id(url, 'full-diagnose', select_hls(media, 'auto')))
             if not media:
                 urls.append('网页回退$' + urllib.parse.quote(url, safe=''))
             return {'list': [{'vod_id': url, 'vod_name': title, 'vod_pic': pic,
@@ -1105,6 +1221,10 @@ class Spider(BaseSpider):
                     parsed.path != '/view_video.php' or
                     not urllib.parse.parse_qs(parsed.query).get('viewkey')):
                 return {'parse': 0, 'url': '', 'msg': '无效视频页面'}
+
+            if quality == 'full-diagnose':
+                report = full_hls_diagnostic(page, data.get('hls') or '')
+                return {'parse': 0, 'url': '', 'msg': report}
 
             if quality == 'diagnose':
                 candidates = [data.get('hls') or ''] + (data.get('alternatives') or [])
