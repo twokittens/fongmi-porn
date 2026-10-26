@@ -373,6 +373,92 @@ def parse_search_performers(source, keyword=''):
     return results
 
 
+
+class VideoLinksParser(HTMLParser):
+    """Collect links and their visible labels from a video detail page."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self.current = None
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == 'a' and self.current is None:
+            self.current = {'href': a.get('href', ''), 'title': a.get('title', ''),
+                            'text': [], 'depth': 1}
+        elif tag == 'a' and self.current is not None:
+            self.current['depth'] += 1
+        elif tag == 'img' and self.current is not None:
+            self.current['title'] = self.current['title'] or a.get('alt', '')
+    def handle_data(self, data):
+        if self.current is not None:
+            self.current['text'].append(data)
+    def handle_endtag(self, tag):
+        if tag == 'a' and self.current is not None:
+            self.current['depth'] -= 1
+            if self.current['depth'] == 0:
+                item = self.current
+                self.current = None
+                item['name'] = clean(' '.join(item['text'])) or clean(item['title'])
+                if item['href'] and item['name']:
+                    self.links.append(item)
+
+
+def detail_links(source):
+    parser = VideoLinksParser()
+    parser.feed(source)
+    performers, tags = [], []
+    seen = set()
+    for item in parser.links:
+        url = absolute(item['href'])
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.netloc not in ('pornhub.com', 'www.pornhub.com', 'cn.pornhub.com'):
+            continue
+        path = parsed.path.rstrip('/')
+        name = item['name']
+        if not name or (url in seen):
+            continue
+        if re.fullmatch(r'/(?:pornstar|model)/[^/]+', path, re.I):
+            performers.append((name, url))
+        elif re.fullmatch(r'/(?:categories|category|video/categories|video/category|tags|tag)/[^/]+', path, re.I):
+            tags.append((name, url))
+        seen.add(url)
+    return performers[:25], tags[:40]
+
+
+def related_cards(source, current_url=''):
+    """Prefer a dedicated related/recommended video section over generic page cards."""
+    sections = re.findall(
+        r'<(?:ul|div|section)\b[^>]*(?:id|class)=["\'][^"\']*'
+        r'(?:relatedVideos|related-videos|recommendedVideos|recommended-videos|relatedVideoSection)'
+        r'[^"\']*["\'][^>]*>', source, re.I)
+    # Some layouts do not wrap related cards in a named section.
+    cards = parse_cards(source) if not sections else []
+    if sections:
+        start = source.find(sections[0])
+        cards = parse_cards(source[start:]) if start >= 0 else []
+    current_key = urllib.parse.parse_qs(urllib.parse.urlsplit(current_url).query).get('viewkey', [''])[0]
+    return [c for c in cards if urllib.parse.parse_qs(
+        urllib.parse.urlsplit(c['vod_id']).query).get('viewkey', [''])[0] != current_key][:60]
+
+
+def search_performer_pages(keyword):
+    """Try the dedicated performer search and general results; preserve source URLs."""
+    query = urllib.parse.quote(keyword)
+    paths = ['/pornstars/search?search=' + query,
+             '/pornstars?search=' + query,
+             '/video/search?search=' + query]
+    found, seen = [], set()
+    for path in paths:
+        try:
+            page = get(path)
+            for item in parse_search_performers(page, keyword):
+                if item['vod_id'] not in seen:
+                    seen.add(item['vod_id'])
+                    found.append(item)
+        except Exception:
+            continue
+    return found
+
 def ld_video(source):
     for raw in re.findall(r'<script\b[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', source, re.I | re.S):
         try:
@@ -407,27 +493,101 @@ def player_config(source):
         return {}
 
 
+def quality_number(value):
+    """Handle scalar quality, quality arrays, and 720p labels."""
+    if isinstance(value, (list, tuple)):
+        nums = [quality_number(x) for x in value]
+        return max(nums) if nums else 0
+    m = re.search(r'(?<!\d)(144|240|360|480|540|720|1080|1440|2160)(?!\d)', str(value or ''))
+    return int(m.group(1)) if m else 0
+
+
 def media_definitions(source):
-    """Expose HLS resolutions only. Do not treat get_media MP4 as verified."""
+    """Return distinct HLS sources. Array quality is a master, not a single tier."""
     config = player_config(source)
     result, seen = [], set()
     for entry in config.get('mediaDefinitions', []):
-        if not isinstance(entry, dict) or str(entry.get('format', '')).lower() != 'hls':
+        if not isinstance(entry, dict) or str(entry.get('format', '')).lower() not in ('hls', 'hls_qs'):
             continue
         url = entry.get('videoUrl', '')
         if not isinstance(url, str):
             continue
-        url = html.unescape(url.replace('\\/', '/'))
+        url = html.unescape(url.replace('\\/', '/')).strip()
         parts = urllib.parse.urlsplit(url)
-        if parts.scheme != 'https' or not parts.path.lower().endswith('.m3u8'):
+        if parts.scheme != 'https' or not parts.netloc or not parts.path.lower().endswith('.m3u8'):
             continue
-        quality = str(entry.get('quality') or entry.get('height') or '').strip()
-        if not quality.isdigit() or (quality, url) in seen:
+        if url in seen:
             continue
-        seen.add((quality, url))
-        result.append((quality, url))
+        seen.add(url)
+        raw_quality = entry.get('quality') or entry.get('height')
+        quality = quality_number(raw_quality)
+        # Arrays often describe the master playlist, not its actual resolution.
+        is_master = isinstance(raw_quality, (list, tuple))
+        result.append({'quality': quality, 'url': url,
+                       'master': is_master, 'default': bool(entry.get('defaultQuality'))})
     return result
 
+
+def playlist_variants(url, source, referer):
+    """Parse an HLS master without downloading any media segments."""
+    variants = []
+    lines = source.splitlines()
+    for i, line in enumerate(lines):
+        if not line.startswith('#EXT-X-STREAM-INF'):
+            continue
+        height = 0
+        m = re.search(r'RESOLUTION\s*=\s*\d+x(\d+)', line, re.I)
+        if m:
+            height = int(m.group(1))
+        if not height:
+            m = re.search(r'NAME\s*=\s*["\']?(\d{3,4})[pP]?', line, re.I)
+            if m: height = int(m.group(1))
+        for candidate in lines[i+1:]:
+            candidate = candidate.strip()
+            if not candidate: continue
+            if candidate.startswith('#'): break
+            child = urllib.parse.urljoin(url, candidate)
+            if urllib.parse.urlsplit(child).scheme == 'https':
+                variants.append((height, child))
+            break
+    return variants
+
+
+def choose_stream(source, page, requested='auto'):
+    """Probe at most three distinct playlists; never select an ad/preview by fallback."""
+    definitions = media_definitions(source)
+    if not definitions:
+        return '', '未找到 HLS 播放源（可能已下架、地区限制或需要登录）'
+    requested_num = quality_number(requested) if requested != 'auto' else 0
+    definitions.sort(key=lambda d: (not d['default'], d['master'], -d['quality']))
+    if requested_num:
+        definitions.sort(key=lambda d: (d['master'], abs(d['quality'] - requested_num), not d['default']))
+    # Check each URL once; do not fetch the media segments.
+    seen = set()
+    for entry in definitions[:3]:
+        url = entry['url']
+        if url in seen: continue
+        seen.add(url)
+        content = fetch_playlist(url, page)
+        if not content:
+            continue
+        variants = playlist_variants(url, content, page)
+        if variants:
+            if requested_num:
+                variants.sort(key=lambda x: (abs(x[0]-requested_num) if x[0] else 9999, -x[0]))
+            else:
+                # Prefer site default rather than automatically forcing highest bitrate.
+                variants.sort(key=lambda x: abs(x[0] - (entry['quality'] or 720)))
+            return variants[0][1], ''
+        if '#EXTINF:' in content:
+            # Reject obviously short complete playlists when a full duration is known.
+            expected = expected_video_duration(source)
+            if expected >= 60 and '#EXT-X-ENDLIST' in content:
+                durations = re.findall(r'^#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)', content, re.M)
+                if durations and sum(map(float, durations)) < expected * 0.7:
+                    continue
+            return url, ''
+    return '', 'HLS 列表无法访问或不包含有效正片；请尝试其他清晰度或网页播放'
 
 def expected_video_duration(source):
     config = player_config(source)
@@ -516,7 +676,7 @@ class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v21（视频与明星搜索）'
+        return 'Pornhub v23（播放兼容修复）'
     def isVideoFormat(self, url):
         return bool(re.search(r'\.(?:mp4|m3u8)(?:[?#]|$)', str(url), re.I))
     def manualVideoCheck(self):
@@ -544,13 +704,20 @@ class Spider(BaseSpider):
                 return {'list': stars, 'page': pg,
                         'pagecount': pg + 1 if stars else pg,
                         'limit': len(stars), 'total': 999999 if stars else 0}
+            if str(tid).startswith('related:'):
+                video_url = str(tid)[len('related:'):]
+                videos = related_cards(get(video_url), video_url) if pg == 1 else []
+                return {'list': videos, 'page': pg, 'pagecount': pg,
+                        'limit': len(videos), 'total': len(videos)}
             if str(tid).startswith('pornstar:'):
                 profile = str(tid)[len('pornstar:'):]
                 parts = urllib.parse.urlsplit(absolute(profile))
                 path = parts.path.rstrip('/') + '/videos'
                 url = absolute(path) + ('?page=' + str(pg) if pg > 1 else '')
                 source = get(url)
-                videos = parse_profile_videos(source)
+                videos = parse_profile_videos(source) or parse_cards(source)
+                if not videos and pg == 1:
+                    videos = parse_profile_videos(get(profile)) or parse_cards(get(profile))
                 return {'list': videos, 'page': pg,
                         'pagecount': pg + 1 if videos else pg,
                         'limit': len(videos), 'total': 999999 if videos else 0}
@@ -578,15 +745,7 @@ class Spider(BaseSpider):
         query = urllib.parse.quote(keyword)
         video_result = self.categoryContent('/video/search?search=' + query, page, False, {})
         videos = video_result.get('list', [])
-        performers = []
-        # Pornhub's performer search is separate from the video search.
-        # Show performers on the first page, preserving video pagination.
-        if page == 1:
-            try:
-                performers = parse_search_performers(
-                    get('/pornstars/search?search=' + query), keyword)
-            except Exception:
-                performers = []
+        performers = search_performer_pages(keyword) if page == 1 else []
         merged = performers + videos
         return {'list': merged, 'page': page,
                 'pagecount': video_result.get('pagecount', page + 1 if merged else page),
@@ -626,8 +785,21 @@ class Spider(BaseSpider):
                 pic = pic[0] if pic else ''
             pic = absolute(pic) if pic else ''
             desc = clean(ld.get('description')) or match_meta(source, 'og:description')
+            performers, tags = detail_links(source)
+            lines = []
+            if performers:
+                lines.append('作者：' + '、'.join(self.link(name, 'pornstar:' + link)
+                                              for name, link in performers))
+            if tags:
+                lines.append('标签：' + '、'.join(self.link(name, link) for name, link in tags))
+            lines.append('相关视频：' + self.link('查看相关视频 ›', 'related:' + url))
+            if desc:
+                lines.append('简介：' + desc)
+            desc = '\n'.join(lines)
             media = media_definitions(source)
-            urls = [f'{quality}P${make_play_id(url, quality)}' for quality, _ in media]
+            urls = ['自动$' + make_play_id(url, 'auto')]
+            urls += [str(q) + 'P$' + make_play_id(url, str(q))
+                     for q in sorted(set(d['quality'] for d in media if d['quality'] and not d['master']), reverse=True)]
             if not urls:
                 urls = ['网页地址$' + urllib.parse.quote(url, safe='')]
             return {'list': [{'vod_id': url, 'vod_name': title, 'vod_pic': pic,
@@ -636,33 +808,26 @@ class Spider(BaseSpider):
         except Exception:
             return {'list': []}
     def playerContent(self, flag, id, vipFlags=None):
-        """Refresh signed HLS once at play time; avoid slow recursive manifest scans.
-
-        A 410 can still happen after handoff if the CDN invalidates the URL.
-        """
-        value = urllib.parse.unquote(str(id))
+        """Refresh signed HLS and verify its manifest before handing it to FongMi."""
         try:
+            value = urllib.parse.unquote(str(id))
             data = json.loads(value)
             page = str(data.get('page') or '')
-            quality = str(data.get('quality') or '').upper().replace('P', '').strip()
-            if not page.startswith(HOST + '/view_video.php'):
+            quality = str(data.get('quality') or 'auto').lower().replace('p', '').strip()
+            parsed = urllib.parse.urlsplit(page)
+            if (parsed.scheme != 'https' or parsed.hostname not in
+                    ('cn.pornhub.com', 'www.pornhub.com', 'pornhub.com') or
+                    parsed.path != '/view_video.php' or
+                    not urllib.parse.parse_qs(parsed.query).get('viewkey')):
                 return {'parse': 0, 'url': '', 'msg': '无效视频页面'}
             source = get(page)
-            choices = media_definitions(source)
-            if quality.isdigit():
-                choices = [(q, u) for q, u in choices if q == quality]
-            else:
-                choices.sort(key=lambda x: int(x[0]), reverse=True)
-            if not choices:
-                return {'parse': 0, 'url': '', 'msg': '未找到对应清晰度的HLS正片地址'}
-            # HLS is taken exclusively from the player mediaDefinitions, never ad fields.
-            # Skip fetching the entire HLS tree here: it can consume a signed URL's TTL.
-            # The player fetches the playlist itself, using the same headers.
-            media_url = choices[0][1]
+            media_url, error = choose_stream(source, page, quality)
+            if not media_url:
+                return {'parse': 0, 'url': '', 'msg': error}
             return {'parse': 0, 'url': media_url, 'header': {
                 'User-Agent': HEADERS['User-Agent'],
                 'Referer': page,
-                'Origin': HOST,
+                'Origin': parsed.scheme + '://' + parsed.netloc,
             }}
-        except Exception:
-            return {'parse': 0, 'url': '', 'msg': '解析失败，请退出重进以刷新播放地址'}
+        except Exception as exc:
+            return {'parse': 0, 'url': '', 'msg': '播放解析失败：' + type(exc).__name__}
