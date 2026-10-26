@@ -3,6 +3,10 @@
 import re
 import html
 import json
+import hmac
+import hashlib
+import time
+import uuid
 import urllib.request
 import urllib.error
 from urllib.parse import urljoin, urlparse, quote, urlencode, parse_qs, unquote, urlsplit, urlunsplit, parse_qsl
@@ -335,6 +339,90 @@ def parse_recommendation_cards(source, current_url, limit=40):
                       'style': {'type': 'rect', 'ratio': 1.78}})
         if len(cards) >= limit:
             break
+    return cards
+
+
+# Public browser token embedded in the supplied MissAV JavaScript bundle.
+RECOMBEE_PUBLIC_TOKEN = 'Ikkg568nlM51RHvldlPvc2GzZPE9R4XGzaH9Qj4zK9npbbbTly1gj9K4mgRn0QlV'
+RECOMBEE_API = 'https://client-rapi-missav.recombee.com'
+RECOMBEE_PROPERTIES = ['title_cn', 'duration', 'has_chinese_subtitle',
+                       'has_english_subtitle', 'is_uncensored_leak', 'dm']
+
+
+def recombee_signed_url(timestamp=None):
+    timestamp = int(time.time()) if timestamp is None else int(timestamp)
+    path = '/missav-default/batch/?frontend_timestamp=' + str(timestamp)
+    digest = hmac.new(RECOMBEE_PUBLIC_TOKEN.encode('utf-8'),
+                      path.encode('utf-8'), hashlib.sha1).hexdigest()
+    return RECOMBEE_API + path + '&frontend_sign=' + digest
+
+
+def recombee_payload(code, user_id):
+    requests = []
+    for scenario, count in [('desktop-watch-next-side', 13),
+                            ('desktop-watch-next-bottom', 16)]:
+        requests.append({
+            'method': 'POST',
+            'path': '/recomms/items/{}/items/'.format(quote(code.lower(), safe='')),
+            'params': {'targetUserId': user_id, 'count': count,
+                       'scenario': scenario, 'returnProperties': True,
+                       'includedProperties': RECOMBEE_PROPERTIES,
+                       'cascadeCreate': True}
+        })
+    return {'requests': requests, 'distinctRecomms': True}
+
+
+def parse_recombee_results(payload, current_code, limit=40):
+    cards, seen = [], set()
+    if isinstance(payload, dict):
+        payload = payload.get('results', payload.get('responses', []))
+    if not isinstance(payload, list):
+        return cards
+    for batch in payload:
+        if not isinstance(batch, dict) or int(batch.get('code', 200)) != 200:
+            continue
+        result = batch.get('json', {})
+        if not isinstance(result, dict):
+            continue
+        for item in result.get('recomms', []):
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get('id', '')).strip().lower()
+            if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{1,100}', code):
+                continue
+            if code == current_code.lower() or code in seen:
+                continue
+            values = item.get('values') or {}
+            if not isinstance(values, dict):
+                values = {}
+            seen.add(code)
+            # The API returns a code, not a complete /dmNN/ video path.
+            # Use the site's canonical /cn/<code> route as the starting point.
+            suffix = '-uncensored-leak' if values.get('is_uncensored_leak') and not code.endswith('-uncensored-leak') else ''
+            target = HOST + '/cn/' + code + suffix
+            # Site covers commonly use the /<code>/cover-n.jpg convention.
+            # This is a best-effort URL, not a cover URL supplied by Recombee.
+            pic = 'https://fourhoi.com/{}/cover-n.jpg'.format(code)
+            seconds = values.get('duration')
+            duration_text = ''
+            try:
+                seconds = int(seconds)
+                if seconds > 0:
+                    duration_text = '{}:{:02d}:{:02d}'.format(seconds // 3600, (seconds // 60) % 60, seconds % 60)
+            except (ValueError, TypeError):
+                pass
+            labels = [code.upper()]
+            if values.get('has_chinese_subtitle'):
+                labels.append('中文字幕')
+            if duration_text:
+                labels.append(duration_text)
+            cards.append({'vod_id': target,
+                          'vod_name': str(values.get('title_cn') or code.upper()),
+                          'vod_pic': pic,
+                          'vod_remarks': ' · '.join(labels),
+                          'style': {'type': 'rect', 'ratio': 1.78}})
+            if len(cards) >= limit:
+                return cards
     return cards
 
 
@@ -747,6 +835,34 @@ class Spider(BaseSpider):
     def homeVideoContent(self):
         return {'list': []}
 
+    def _recombee_recommendations(self, code, video_url):
+        # Recombee accepts a per-user UUID. A fresh ID avoids reusing the
+        # browser user's personal identifier supplied in the HAR sample.
+        user_id = str(uuid.uuid4())
+        body = json.dumps(recombee_payload(code, user_id), ensure_ascii=False)
+        url = recombee_signed_url()
+        headers = {'Accept': 'application/json',
+                   'Content-Type': 'application/json',
+                   'Origin': HOST, 'Referer': video_url,
+                   'User-Agent': UA}
+        try:
+            response = self.net.req(url, {
+                'method': 'POST', 'timeout': 20000,
+                'headers': headers, 'data': body,
+            })
+            if isinstance(response, str):
+                response = json.loads(response)
+            if not isinstance(response, dict):
+                raise ValueError('net.req 响应类型异常')
+            status = int(response.get('code', response.get('status', 0)) or 0)
+            raw = response.get('content', '')
+            if status != 200:
+                raise ValueError('Recombee HTTP {}'.format(status))
+            payload = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+            return parse_recombee_results(payload, code), ''
+        except Exception as error:
+            return [], 'Recombee 推荐请求失败: {}'.format(str(error))
+
     def categoryContent(self, tid, pg, filter, extend):
         if str(tid).startswith(RECOMMEND_PREFIX):
             url = unquote(str(tid)[len(RECOMMEND_PREFIX):])
@@ -758,13 +874,14 @@ class Spider(BaseSpider):
                 page = 1
             if page > 1:
                 return {'list': [], 'page': page, 'pagecount': page, 'limit': 40, 'total': 0}
-            status, body, blocked = self._request(url)
-            cards = parse_recommendation_cards(body, url) if status == 200 and not blocked else []
-            # MissAV recommendations are populated by client-side Recombee JavaScript.
-            # When absent from HTTP HTML, don't substitute unrelated search results.
+            code, _ = version_info(url)
+            if not code:
+                return {'list': [], 'page': 1, 'pagecount': 1,
+                        'limit': 40, 'total': 0, 'msg': '无法从视频地址识别番号'}
+            cards, error = self._recombee_recommendations(code, url)
             return {'list': cards, 'page': 1, 'pagecount': 1,
                     'limit': 40, 'total': len(cards),
-                    'msg': '' if cards else '当前网页源码未包含相关推荐卡片（网站通过 JavaScript 动态加载）。'}
+                    'msg': error if not cards else ''}
         # Folder cards are routed to categoryContent using their vod_id.
         # Use the real entity URL as the category id to retain site pagination.
         entity_path = urlsplit(absolute(tid)).path.rstrip('/')
@@ -968,8 +1085,8 @@ class Spider(BaseSpider):
         return {'list': [{
             'vod_id': vid, 'vod_name': name,
             'vod_pic': absolute(parser.meta.get('og:image')) if parser.meta.get('og:image') else '',
-            'vod_actor': '、'.join(actress_links),
-            'vod_director': recommend_link,
+            'vod_actor': '、'.join(actress_links + [recommend_link]),
+            'vod_director': 'MissAV',
             'vod_content': parser.meta.get('description', '') +
                            ('\n可选版本：' + '、'.join(label for label, _ in groups)
                             if groups else '\n没有解析出有效播放线路'),
