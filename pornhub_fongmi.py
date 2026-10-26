@@ -530,9 +530,13 @@ def quality_number(value):
 
 
 def media_definitions(source):
-    """Return distinct HLS sources. Array quality is a master, not a single tier."""
+    """Normalize and deduplicate mediaDefinitions without touching signed URLs.
+
+    A quality array describes available renditions, NOT a fixed quality.
+    Identical URLs (including an array/scalar duplicate) are one source.
+    """
     config = player_config(source)
-    result, seen = [], set()
+    result, indexes = [], {}
     for entry in config.get('mediaDefinitions', []):
         if not isinstance(entry, dict) or str(entry.get('format', '')).lower() not in ('hls', 'hls_qs'):
             continue
@@ -543,17 +547,35 @@ def media_definitions(source):
         parts = urllib.parse.urlsplit(url)
         if parts.scheme != 'https' or not parts.netloc or not parts.path.lower().endswith('.m3u8'):
             continue
-        if url in seen:
-            continue
-        seen.add(url)
         raw_quality = entry.get('quality') or entry.get('height')
         quality = quality_number(raw_quality)
-        # Arrays often describe the master playlist, not its actual resolution.
-        is_master = isinstance(raw_quality, (list, tuple))
-        result.append({'quality': quality, 'url': url,
-                       'master': is_master, 'default': bool(entry.get('defaultQuality'))})
+        master = isinstance(raw_quality, (list, tuple))
+        key = url  # Never normalize query parameters of a signed CDN URL.
+        if key in indexes:
+            old = result[indexes[key]]
+            old['master'] = old['master'] or master
+            old['default'] = old['default'] or bool(entry.get('defaultQuality'))
+            old['quality'] = max(old['quality'], quality)
+            continue
+        indexes[key] = len(result)
+        result.append({'quality': quality, 'url': url, 'master': master,
+                       'default': bool(entry.get('defaultQuality'))})
     return result
 
+
+def ranked_streams(definitions, requested='auto'):
+    """Return distinct candidates; no probing or media downloads."""
+    target = quality_number(requested) if requested != 'auto' else 0
+    masters = [d for d in definitions if d['master']]
+    fixed = [d for d in definitions if not d['master'] and d['quality']]
+    unknown = [d for d in definitions if not d['master'] and not d['quality']]
+    if target:
+        ordered = (sorted(fixed, key=lambda d: (abs(d['quality'] - target), not d['default']))
+                   + sorted(masters, key=lambda d: not d['default']) + unknown)
+    else:
+        ordered = (sorted(masters, key=lambda d: (not d['default'], -d['quality']))
+                   + sorted(fixed, key=lambda d: (not d['default'], abs(d['quality'] - 720))) + unknown)
+    return ordered
 
 def playlist_variants(url, source, referer):
     """Parse an HLS master without downloading any media segments."""
@@ -703,7 +725,7 @@ class Spider(BaseSpider):
     def init(self, extend=''):
         pass
     def getName(self):
-        return 'Pornhub v25（真实详情信息及播放修复）'
+        return 'Pornhub v28（HLS多源备选）'
 
     def safe_link(self, name, target):
         # FongMi link expects a target dictionary, not a plain string.
@@ -845,6 +867,11 @@ class Spider(BaseSpider):
             urls = ['自动$' + make_play_id(url, 'auto')]
             urls += [str(q) + 'P$' + make_play_id(url, str(q))
                      for q in sorted(set(d['quality'] for d in media if d['quality'] and not d['master']), reverse=True)]
+            # Explicit backup entries make a different CDN candidate selectable
+            # when FongMi cannot retry after a segment-level HTTP 410.
+            backup_count = min(3, max(0, len(ranked_streams(media, 'auto')) - 1))
+            urls += ['备用源%d$' % n + make_play_id(url, 'backup%d' % n)
+                     for n in range(1, backup_count + 1)]
             if not media:
                 urls.append('网页回退$' + urllib.parse.quote(url, safe=''))
             return {'list': [{'vod_id': url, 'vod_name': title, 'vod_pic': pic,
@@ -874,27 +901,14 @@ class Spider(BaseSpider):
             definitions = media_definitions(source)
             if not definitions:
                 return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
-            target = quality_number(quality) if quality != 'auto' else 0
-            # A quality array represents an HLS master candidate; its maximum
-            # resolution must never be mistaken for a fixed-resolution stream.
-            masters = [d for d in definitions if d['master']]
-            fixed = [d for d in definitions if not d['master'] and d['quality'] > 0]
-            unknown = [d for d in definitions if not d['master'] and not d['quality']]
-            if not target:
-                # Let the player select a rendition from the master playlist.
-                # No preflight: avoid spending signed-URL lifetime in Python.
-                candidates = sorted(masters, key=lambda d: (not d['default'], -d['quality']))
-                candidates += sorted(fixed, key=lambda d: (not d['default'], abs(d['quality'] - 720)))
-                candidates += unknown
-            else:
-                # A fixed-quality selection must not silently resolve to the
-                # same master URL used by Auto when a matching fixed stream exists.
-                candidates = sorted(fixed, key=lambda d: (abs(d['quality'] - target), not d['default']))
-                candidates += sorted(masters, key=lambda d: not d['default'])
-                candidates += unknown
-            if not candidates:
-                return {'parse': 0, 'url': '', 'msg': '没有匹配的 HLS 播放源'}
-            media_url = candidates[0]['url']
+            # A backup explicitly selects the Nth distinct Auto candidate.
+            # It is intentionally not an automatic retry of an expired URL.
+            backup_match = re.fullmatch(r'backup([1-3])', quality)
+            candidates = ranked_streams(definitions, 'auto' if backup_match else quality)
+            index = int(backup_match.group(1)) if backup_match else 0
+            if len(candidates) <= index:
+                return {'parse': 0, 'url': '', 'msg': '没有匹配的 HLS 备用播放源'}
+            media_url = candidates[index]['url']
             return {'parse': 0, 'url': media_url, 'header': {
                 'User-Agent': HEADERS['User-Agent'],
                 'Referer': page,
