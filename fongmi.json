@@ -57,7 +57,7 @@
       "ext": {}
     },
     {
-      "key": "pornhub_python_v26",
+      "key": "pornhub_python_v28",
       "name": "Pornhub",
       "type": 3,
       "api": "./pornhub_fongmi.py",
