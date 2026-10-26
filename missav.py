@@ -772,6 +772,34 @@ class Spider(BaseSpider):
                 return sorted(choices, key=lambda item: quality_rank(item[0]), reverse=True)
         return [('自动/原始', stream_url)]
 
+def detail_related(source, current_url):
+    """Extract actress profile links and video cards from the actual detail HTML.
+
+    Never synthesize an actress URL: only use links present in the page.
+    """
+    actresses = []
+    seen = set()
+    pattern = r'<a\b([^>]*\bhref\s*=\s*[\"\']([^\"\']+)[\"\'][^>]*)>(.*?)</a\s*>'
+    for m in re.finditer(pattern, source, re.I | re.S):
+        url = absolute(html.unescape(m.group(2)))
+        if not re.search(r'/(?:dm\d+/)?cn/actresses/[^/?#]+', urlsplit(url).path, re.I):
+            continue
+        if url in seen:
+            continue
+        body = m.group(3)
+        name = re.sub(r'<[^>]*>', ' ', body)
+        name = re.sub(r'\s+', ' ', html.unescape(name)).strip()
+        img = re.search(r'<img\b[^>]*(?:data-src|src)=[\"\']([^\"\']+)', body, re.I | re.S)
+        pic = absolute(img.group(1)) if img else ''
+        if not name:
+            name = unquote(urlsplit(url).path.rstrip('/').split('/')[-1]).replace('-', ' ')
+        actresses.append({'name': name, 'url': url, 'pic': pic})
+        seen.add(url)
+    cards, _ = parse_videos(source)
+    related = [v for v in cards if v['vod_id'] != current_url][:24]
+    return actresses[:12], related
+
+
     def detailContent(self, ids):
         vid = ids[0] if isinstance(ids, (list, tuple)) else str(ids)
         if str(vid).startswith('missavdir:'):
@@ -799,6 +827,7 @@ class Spider(BaseSpider):
         name = (' '.join(parser.title_text).strip() or
                 parser.meta.get('og:title') or vid.rsplit('/', 1)[-1])
         code, _ = version_info(vid)
+        actresses, related = detail_related(source, vid)
         # Discover real same-code variants via the verified /cn/search/<code> page.
         # Do not guess /dmNN/ paths: they can differ between versions.
         candidates = [vid]
@@ -854,10 +883,20 @@ class Spider(BaseSpider):
             if entries:
                 groups.append((label, '#'.join(entries)))
                 seen_versions.add(label)
+        if related:
+            recommended = ['{}$missavpage:{}'.format(
+                re.sub(r'[$#]', ' ', item['vod_name'])[:70],
+                quote(item['vod_id'], safe='')) for item in related]
+            groups.append(('MissAV相关推荐', '#'.join(recommended)))
+        actress_names = '、'.join(a['name'] for a in actresses)
+        actress_info = ('\n女优：' + actress_names) if actress_names else ''
+        if actresses:
+            actress_info += '\n女优作品入口：女优一览 / 搜索女优姓名'
         return {'list': [{
             'vod_id': vid, 'vod_name': name,
+            'vod_actor': actress_names,
             'vod_pic': absolute(parser.meta.get('og:image')) if parser.meta.get('og:image') else '',
-            'vod_content': parser.meta.get('description', '') +
+            'vod_content': parser.meta.get('description', '') + actress_info +
                            ('\n可选版本：' + '、'.join(label for label, _ in groups)
                             if groups else '\n没有解析出有效播放线路'),
             'vod_play_from': '$$$'.join(label for label, _ in groups),
