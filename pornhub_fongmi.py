@@ -854,6 +854,84 @@ def diagnose_hls(url, referer):
     messages.append(result)
     return ' | '.join(messages)
 
+
+def diagnose_compare(url, referer):
+    """Compare repeated first-segment requests without exposing signed URLs."""
+    import hashlib
+    import socket
+    def identity(target):
+        p = urllib.parse.urlsplit(target)
+        q = urllib.parse.parse_qs(p.query)
+        exp = next((q[k][0] for k in ('validto', 'expires', 'expire', 'exp') if k in q), '')
+        try:
+            remaining = str(int(float(exp) - time.time())) + 's' if exp else '?'
+        except (TypeError, ValueError):
+            remaining = '?'
+        token = hashlib.sha256(target.encode('utf-8')).hexdigest()[:10]
+        return '%s #%s 剩余%s' % (p.hostname or '?', token, remaining)
+
+    headers = {**HEADERS, 'Referer': referer,
+               'Origin': urllib.parse.urlsplit(referer).scheme + '://' + urllib.parse.urlsplit(referer).netloc,
+               'Accept': '*/*'}
+    def fetch(target, segment=False):
+        try:
+            h = dict(headers)
+            if segment:
+                h['Range'] = 'bytes=0-1023'
+            req = urllib.request.Request(target, headers=h)
+            with urllib.request.urlopen(req, timeout=6) as response:
+                status = getattr(response, 'status', 200)
+                raw = response.read(2048 if segment else 131072)
+                final_url = response.geturl()
+                ctype = (response.headers.get('Content-Type') or '').lower()
+            if not segment and not raw.lstrip().startswith(b'#EXTM3U'):
+                return None, 'HTTP%d/非M3U8' % status, final_url
+            if segment and ('text/html' in ctype or raw.lstrip().startswith(b'<!DOCTYPE html')):
+                return None, 'HTTP%d/HTML' % status, final_url
+            return (raw if segment else raw.decode('utf-8-sig', 'replace')), 'HTTP%d' % status, final_url
+        except urllib.error.HTTPError as e:
+            return None, 'HTTP%d' % e.code, target
+        except urllib.error.URLError as e:
+            reason = e.reason
+            return None, 'URL/' + ('Timeout' if isinstance(reason, socket.timeout) else type(reason).__name__), target
+        except (OSError, TimeoutError, ValueError) as e:
+            return None, type(e).__name__, target
+
+    def first_uri(content):
+        for line in content.splitlines():
+            line = line.strip()
+            if line and not line.startswith('#'):
+                return line
+        return ''
+
+    if not hls_is_fresh(url, margin=0):
+        return 'HLS过期/无效 ' + identity(url)
+    master, status, final = fetch(url)
+    result = ['主:%s' % status, '主地址:%s' % identity(final)]
+    if master is None:
+        return ' | '.join(result)
+    child_url = final
+    if '#EXT-X-STREAM-INF' in master:
+        path = first_uri(master)
+        if not path:
+            return ' | '.join(result + ['子:未找到'])
+        child_url = urllib.parse.urljoin(final, path)
+        child, status, final_child = fetch(child_url)
+        result.append('子:%s' % status)
+        if child is None:
+            return ' | '.join(result + ['子地址:' + identity(child_url)])
+        master, child_url = child, final_child
+    path = first_uri(master)
+    if not path:
+        return ' | '.join(result + ['分片:未找到'])
+    seg = urllib.parse.urljoin(child_url, path)
+    result.append('分片地址:' + identity(seg))
+    # Same URL, same request headers, repeated twice: distinguishes persistent 410 from intermittent 410.
+    for i in range(2):
+        _, status, _ = fetch(seg, segment=True)
+        result.append('首分片第%d次:%s' % (i+1, status))
+    return ' | '.join(result)
+
 class Spider(BaseSpider):
     def init(self, extend=''):
         pass
@@ -1006,7 +1084,7 @@ class Spider(BaseSpider):
             if not media:
                 urls.append('网页回退$' + urllib.parse.quote(url, safe=''))
             return {'list': [{'vod_id': url, 'vod_name': title, 'vod_pic': pic,
-                              'vod_content': desc + '\n测试：在选集中点击 🔎诊断HLS，查看主列表/子列表/首分片结果。', 'vod_play_from': '实时HLS' if media else '网页回退',
+                              'vod_content': desc + '\n测试：点击 🔎诊断HLS，对比首分片同地址连续两次请求结果、CDN及签名剩余时间。', 'vod_play_from': '实时HLS' if media else '网页回退',
                               'vod_play_url': '#'.join(urls)}]}
         except Exception as exc:
             # A broken metadata parser must not prevent opening a video page.
@@ -1039,8 +1117,8 @@ class Spider(BaseSpider):
                                 (' HTTP ' + str(exc.code) if isinstance(exc, urllib.error.HTTPError) else '')}
                 reports = []
                 for i, candidate in enumerate(candidates[:3]):
-                    reports.append('源%d: %s' % (i+1, diagnose_hls(candidate, page)))
-                return {'parse': 0, 'url': '', 'msg': '；'.join(reports) if reports else '未找到HLS地址'}
+                    reports.append('源%d: %s' % (i+1, diagnose_compare(candidate, page)))
+                return {'parse': 0, 'url': '', 'msg': '\n'.join(reports) if reports else '未找到HLS地址'}
 
             headers = {'User-Agent': HEADERS['User-Agent'], 'Referer': page,
                        'Origin': parsed.scheme + '://' + parsed.netloc}
