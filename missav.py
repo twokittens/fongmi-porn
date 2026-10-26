@@ -1209,7 +1209,7 @@ class Spider(BaseSpider):
             'vod_area': '',
             'vod_year': '',
             'vod_pubdate': '',
-            'vod_content': '\n'.join([recommend_link] + list(filter(None, metadata_rows))),
+            'vod_content': '\n'.join(['相关推荐：' + recommend_link] + list(filter(None, metadata_rows))),
             'vod_remarks': '',
             'vod_play_from': '$$$'.join(label for label, _ in groups),
             'vod_play_url': '$$$'.join(items for _, items in groups)
