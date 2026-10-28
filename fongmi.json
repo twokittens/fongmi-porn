@@ -93,6 +93,15 @@
       "changeable": 0
     },
     {
+      "key": "pmvhaven_python",
+      "name": "PMVHaven",
+      "type": 3,
+      "api": "./pmvhaven_fongmi.py",
+      "searchable": 1,
+      "quickSearch": 0,
+      "filterable": 0
+    },
+    {
       "key": "missav_verify",
       "name": "MissAV 人机验证",
       "type": 3,
