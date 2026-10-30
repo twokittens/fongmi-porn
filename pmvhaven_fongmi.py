@@ -118,7 +118,6 @@ class Spider(BaseSpider):
 
     def init(self, extend=""):
         self.video_cache = {}
-        self.hls_cache = {}
         self.last_error = ""
 
     def destroy(self):
@@ -284,14 +283,14 @@ class Spider(BaseSpider):
     # ========================================
 
     def _parse_list(self, data, page, limit):
-        videos = data.get("videos")
+        videos = data.get("videos") or data.get("results") or data.get("items")
         pagination = data.get("pagination") or {}
 
         if not isinstance(videos, list):
             nested = data.get("data")
 
             if isinstance(nested, dict):
-                videos = nested.get("videos")
+                videos = nested.get("videos") or nested.get("results") or nested.get("items")
                 pagination = (
                     nested.get("pagination") or pagination
                 )
@@ -515,7 +514,7 @@ class Spider(BaseSpider):
 
         if re.fullmatch(r"[0-9a-fA-F]{24}", vod_id):
             cache = getattr(self, "video_cache", {})
-            return cache.get(vod_id, {})
+            return cache.get(vod_id, {"_id": vod_id})
 
         return {}
 
@@ -541,82 +540,71 @@ class Spider(BaseSpider):
             return name
 
     # ========================================
-    # HLS 真实画质解析
+    # 详情数据补全（不依赖内存缓存）
     # ========================================
 
-    def _get_hls_qualities(self, video_url=""):
-        """只使用 API 的 videoUrl 构造 HLS；绝不使用 _id 拼接地址。"""
-        if not hasattr(self, "hls_cache"):
-            self.hls_cache = {}
-        video_url = str(video_url or "").strip()
-        now = time.time()
-        cached = self.hls_cache.get(video_url)
-        if cached and now - cached[0] < 600:
-            self.hls_diagnostic = "缓存命中：" + cached[1]
-            return cached[1], cached[2]
+    def _extract_video(self, data):
+        if not isinstance(data, dict):
+            return {}
+        for key in ("video", "data", "result"):
+            obj = data.get(key)
+            if isinstance(obj, dict):
+                nested = self._extract_video(obj)
+                if nested:
+                    return nested
+        if data.get("_id") or data.get("videoUrl"):
+            return data
+        return {}
 
-        candidates = []
-        if video_url:
-            parsed = U.urlsplit(video_url)
-            path = parsed.path
-            if path:
-                if path.lower().endswith(".m3u8"):
-                    # videoUrl 本身就是 HLS 地址时直接使用。
-                    if parsed.scheme in ("http", "https") and parsed.netloc:
-                        candidates.append(U.urlunsplit((parsed.scheme, parsed.netloc, path, "", "")))
-                    elif path.startswith("/"):
-                        candidates.append(CLOUD + path)
-                else:
-                    # 以 videoUrl 的真实文件路径作为目录，追加 master.m3u8。
-                    # 例如 /videos/xxx.mp4 -> /videos/xxx.mp4/master.m3u8
-                    hls_path = path.rstrip("/") + "/master.m3u8"
-                    if parsed.scheme in ("http", "https") and parsed.netloc:
-                        # videoUrl 使用其它 CDN 时，保留它的文件路径，映射到 HLS 云存储域名。
-                        candidates.append(CLOUD + (hls_path if hls_path.startswith("/") else "/" + hls_path))
-                    else:
-                        candidates.append(CLOUD + (hls_path if hls_path.startswith("/") else "/" + hls_path))
+    def _fetch_video(self, vid):
+        """仅通过详情接口补全字段；不使用 ID 拼接任何播放地址。"""
+        vid = str(vid or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{24}", vid):
+            return {}
+        # 不同站点部署可能采用不同详情路由，逐个验证返回数据。
+        for path in ("/api/videos/", "/api/video/"):
+            data = self._request_json(HOST + path + U.quote(vid, safe=""))
+            video = self._extract_video(data)
+            if video and str(video.get("_id") or vid) == vid:
+                normalized = self._video_info(dict(video, _id=vid))
+                if normalized:
+                    return normalized
+                return video
+        return {}
 
-        errors = []
-        for master_url in candidates:
-            content = self._request(
-                master_url,
-                accept="application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*",
-                timeout=12
-            )
-            if not content.lstrip().startswith("#EXTM3U"):
-                errors.append(master_url + " => " + (self.last_error or "非M3U8内容"))
-                continue
+    def _resolve_info(self, vod_id):
+        info = self._read_video_id(vod_id)
+        vid = str(info.get("_id") or "").strip()
+        if not vid and re.fullmatch(r"[0-9a-fA-F]{24}", str(vod_id or "")):
+            vid = str(vod_id)
+        if not vid:
+            return info
+        # 搜索接口的 videoUrl 可能缺失，必须尝试详情接口补全。
+        if not self._valid_mp4(info.get("videoUrl")):
+            fetched = self._fetch_video(vid)
+            if fetched:
+                info = dict(info, **{k: v for k, v in fetched.items() if v not in (None, "", [], {})})
+        if info:
+            if not hasattr(self, "video_cache"):
+                self.video_cache = {}
+            self.video_cache[vid] = info
+        return info
 
-            lines = [line.strip() for line in content.splitlines()]
-            qualities = []
-            seen = set()
-            for index, line in enumerate(lines):
-                if not line.startswith("#EXT-X-STREAM-INF:"):
-                    continue
-                match = re.search(r"RESOLUTION\s*=\s*(\d+)x(\d+)", line, re.I)
-                if not match:
-                    continue
-                height = int(match.group(2))
-                for next_line in lines[index + 1:]:
-                    if not next_line:
-                        continue
-                    if next_line.startswith("#EXT-X-STREAM-INF:"):
-                        break
-                    if next_line.startswith("#"):
-                        continue
-                    stream_url = U.urljoin(master_url, next_line)
-                    if height > 0 and height not in seen and stream_url.startswith(("https://", "http://")):
-                        seen.add(height)
-                        qualities.append({"name": "{}P".format(height),
-                                          "url": stream_url, "height": height})
-                    break
-            qualities.sort(key=lambda x: x["height"], reverse=True)
-            self.hls_cache[video_url] = (now, master_url, qualities)
-            self.hls_diagnostic = "成功：" + master_url + "；画质：" + ",".join(q["name"] for q in qualities)
-            return master_url, qualities
+    def _valid_mp4(self, url):
+        url = str(url or "").strip()
+        if url.startswith("//"):
+            url = "https:" + url
+        elif url.startswith("/"):
+            url = U.urljoin(HOST, url)
+        return url.startswith(("https://", "http://")) and bool(U.urlsplit(url).netloc)
 
-        self.hls_diagnostic = "videoUrl=" + (video_url or "空") + "；" + (" | ".join(errors)[-1800:] or "没有可测试的HLS地址")
-        return "", []
+    def _normalize_video_url(self, url):
+        url = str(url or "").strip()
+        if url.startswith("//"):
+            return "https:" + url
+        if url.startswith("/"):
+            return U.urljoin(HOST, url)
+        return url
 
     # ========================================
     # 构造 FongMi 播放线路
@@ -624,8 +612,8 @@ class Spider(BaseSpider):
 
     def _build_play_sources(self, info):
         """只使用 API 返回的原始 MP4 地址，不请求 HLS。"""
-        mp4 = str(info.get("videoUrl") or "").strip()
-        if mp4.startswith(("https://", "http://")):
+        mp4 = self._normalize_video_url(info.get("videoUrl"))
+        if self._valid_mp4(mp4):
             return "原始MP4", "原始播放$" + mp4
         return "", ""
 
@@ -640,7 +628,7 @@ class Spider(BaseSpider):
             else ids
         )
 
-        info = self._read_video_id(vod_id)
+        info = self._resolve_info(vod_id)
 
         if not info:
             return {
@@ -768,10 +756,15 @@ class Spider(BaseSpider):
         url = str(id or "").strip()
 
         if url.startswith("pmv:"):
-            info = self._read_video_id(url)
-            url = str(info.get("videoUrl") or "")
+            info = self._resolve_info(url)
+            url = self._normalize_video_url(info.get("videoUrl"))
+        elif re.fullmatch(r"[0-9a-fA-F]{24}", url):
+            info = self._resolve_info(url)
+            url = self._normalize_video_url(info.get("videoUrl"))
+        else:
+            url = self._normalize_video_url(url)
 
-        if not url.startswith(("http://", "https://")):
+        if not self._valid_mp4(url):
             return {
                 "parse": 0,
                 "url": "",
