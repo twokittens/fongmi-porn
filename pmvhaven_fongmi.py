@@ -570,8 +570,10 @@ class Spider(BaseSpider):
         if not hasattr(self, "hls_cache"):
             self.hls_cache = {}
 
-        if not video_id or hls_enabled is False:
+        if not video_id:
             return "", []
+
+        # hlsEnabled 可能来自较早的列表缓存；以实际播放列表为准。
 
         now = time.time()
 
@@ -662,6 +664,7 @@ class Spider(BaseSpider):
             reverse=True
         )
 
+        # 仅在取得可播放变体时缓存，避免把单层/异常列表误判为多画质。
         self.hls_cache[video_id] = (
             now,
             master_url,
@@ -876,6 +879,20 @@ class Spider(BaseSpider):
                 "url": "",
                 "msg": "播放地址无效或已失效",
             }
+
+        # FongMi 多画质播放器入口：点击 HLS 自动画质时，
+        # 尝试使用已经解析出的真实变体 URL，而不是构造虚假 MP4 地址。
+        if flag == "HLS画质" and url.lower().split("?", 1)[0].endswith("/master.m3u8"):
+            video_id = U.unquote(U.urlsplit(url).path.rstrip("/").split("/")[-2])
+            master, qualities = self._get_hls_qualities(video_id)
+            if master and qualities:
+                values = [{"n": "自动", "v": master}]
+                values.extend({"n": q["name"], "v": q["url"]} for q in qualities)
+                return {
+                    "parse": 0,
+                    "url": {"values": values, "position": 0},
+                    "header": PLAY_HEADERS,
+                }
 
         return {
             "parse": 0,
