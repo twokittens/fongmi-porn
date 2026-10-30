@@ -98,8 +98,9 @@
       "type": 3,
       "api": "./pmvhaven_fongmi.py",
       "searchable": 1,
-      "quickSearch": 0,
-      "filterable": 0
+      "quickSearch": 1,
+      "filterable": 0,
+      "changeable": 0
     },
     {
       "key": "missav_verify",
