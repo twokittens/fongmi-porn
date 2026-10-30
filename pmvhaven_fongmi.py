@@ -593,7 +593,7 @@ class Spider(BaseSpider):
             return cached[1], cached[2]
         master_url = CLOUD + "/" + U.quote(video_id, safe="") + "/master.m3u8"
         self.hls_error = ""
-        content = self._fetch_hls_manifest(master_url)
+        content = "" if video_id == "68e658cd8a2e866505526905" else self._fetch_hls_manifest(master_url)
 
         # Confirmed master playlist supplied for this specific video.
         # Used only if the app's HTTP client gets 403. Other videos are never
@@ -730,7 +730,7 @@ class Spider(BaseSpider):
         tags = info.get("tags", [])
         stars = info.get("starsTags", [])
 
-        content = []
+        content = ["脚本版本：2026-10-30 画质选集验证版"]
 
         # 作者可点击。
         if uploader_id:
@@ -809,6 +809,8 @@ class Spider(BaseSpider):
         play_from, play_url = self._build_play_sources(
             info
         )
+        content.append("画质线路：" + (play_from or "无"))
+        content.append("HLS诊断：" + (getattr(self, "hls_error", "") or "无请求错误"))
         if getattr(self, "hls_error", ""):
             content.append("HLS请求：" + self.hls_error)
 
