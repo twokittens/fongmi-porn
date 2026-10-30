@@ -670,11 +670,14 @@ VERSION_SUFFIXES = ('-uncensored-leak-chinese-subtitle',
 
 
 def version_info(url):
-    path = urlparse(url).path.rstrip('/')
-    slug = path.rsplit('/', 1)[-1].lower()
+    """Identify video slugs without requiring a particular studio code format."""
+    full_url = absolute(url)
+    if not valid_video(full_url):
+        return '', ''
+    slug = unquote(urlsplit(full_url).path.rstrip('/').rsplit('/', 1)[-1]).lower()
     suffix = next((s for s in VERSION_SUFFIXES if slug.endswith(s)), '')
     code = slug[:-len(suffix)] if suffix else slug
-    if not re.match(r'^(?:[a-z][a-z0-9]*-\d+|fc2(?:-ppv)?-\d+)$', code):
+    if not code or not re.search(r'\d', code):
         return '', ''
     if 'uncensored-leak' in suffix and 'chinese-subtitle' in suffix:
         label = '无码中文字幕'
@@ -1039,20 +1042,16 @@ class Spider(BaseSpider):
                 'total': (client_page + 1) * n if n else client_page * 20}
 
     def _qualities(self, stream_url):
-        # Some MissAV streams are direct 1080p/video.m3u8 and 720p/video.m3u8.
-        # They are media playlists without EXT-X-STREAM-INF. Never discard them.
+        """Inspect HLS master manifests first; retain the original stream on failure."""
         hinted = stream_quality_hint(stream_url)
         if not re.search(r'\.m3u8(?:[?#]|$)', stream_url, re.I):
             return [(hinted or '原始画质', stream_url)]
-        # Explicit CDN path gives a useful resolution label without a network roundtrip.
-        if hinted:
-            return [(hinted, stream_url)]
         status, manifest, challenge = self._request(stream_url)
         if status == 200 and not challenge and '#EXTM3U' in manifest[:200]:
             choices = parse_master_playlist(manifest, stream_url)
             if choices:
                 return sorted(choices, key=lambda item: quality_rank(item[0]), reverse=True)
-        return [('自动/原始', stream_url)]
+        return [(hinted or '自动/原始', stream_url)]
 
     def detailContent(self, ids):
         vid = ids[0] if isinstance(ids, (list, tuple)) else str(ids)
@@ -1135,6 +1134,8 @@ class Spider(BaseSpider):
         # Discover real same-code variants via the verified /cn/search/<code> page.
         # Do not guess /dmNN/ paths: they can differ between versions.
         candidates = [vid]
+        # Variant discovery is optional; a valid current page must play even
+        # when search is unavailable or returns no results.
         if code:
             search_status, search_html, search_blocked = self._request(
                 '/cn/search/' + quote(code, safe=''))
@@ -1145,30 +1146,41 @@ class Spider(BaseSpider):
                     other_code, _ = version_info(url)
                     if other_code == code and url not in candidates:
                         candidates.append(url)
-        # Do not add speculative versions; the search results must contain them.
+        # Playback depends on real page media, never on successful code recognition.
+        # Only optional same-code version discovery uses the parsed code.
         groups = []
         seen_versions = set()
         for page in candidates:
-            if page == vid:
+            current = page == vid
+            if current:
                 body = source
             else:
                 status, body, blocked = self._request(page)
                 if status != 200 or blocked:
                     continue
-            found_code, label = version_info(page)
-            if not found_code or (code and found_code != code) or label in seen_versions:
-                continue
-            # Sites can return a generic 200 fallback page for missing slugs.
-            canonical = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)', body, re.I)
-            ogurl = re.search(r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\']([^"\']+)', body, re.I)
-            actual = (canonical or ogurl)
-            if actual:
-                actual_code, actual_label = version_info(html.unescape(actual.group(1)))
-                if actual_code != found_code or actual_label != label:
-                    continue
+
+            # Extract streams BEFORE checking identifiers or version metadata.
             streams = extract_sources(body)
             if not streams:
                 continue
+
+            found_code, label = version_info(page)
+            if not current:
+                if not found_code or found_code != code:
+                    continue
+                # Validate optional variant URLs, not the original requested page.
+                canonical = re.search(r"<link[^>]+rel=[\"\']canonical[\"\'][^>]+href=[\"\']([^\"\']+)", body, re.I)
+                ogurl = re.search(r"<meta[^>]+property=[\"\']og:url[\"\'][^>]+content=[\"\']([^\"\']+)", body, re.I)
+                actual = canonical or ogurl
+                if actual:
+                    actual_code, actual_label = version_info(html.unescape(actual.group(1)))
+                    if actual_code != found_code or actual_label != label:
+                        continue
+            if not label:
+                label = '普通版'
+            if label in seen_versions:
+                continue
+
             entries = []
             seen_urls = set()
             for stream_label, stream_url in streams:
@@ -1176,13 +1188,11 @@ class Spider(BaseSpider):
                     if media_url in seen_urls:
                         continue
                     seen_urls.add(media_url)
-                    # Preserve every independently available URL, even if the CDN
-                    # manifest is unavailable. Only use labels supported by the URL
-                    # or by an HLS master playlist's RESOLUTION metadata.
                     entries.append((quality, stream_label, media_url))
             entries.sort(key=lambda item: quality_rank(item[0]), reverse=True)
+            # The code is optional: an empty value still produces a valid play URL.
             entries = ['{} · {}${}'.format(
-                quality, stream_label, encode_play(found_code, media_url))
+                quality, stream_label, encode_play(found_code or '', media_url))
                 for quality, stream_label, media_url in entries]
             if entries:
                 groups.append((label, '#'.join(entries)))
