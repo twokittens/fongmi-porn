@@ -94,7 +94,7 @@
     },
     {
       "key": "pmvhaven_python",
-      "name": "PMVHaven",
+      "name": "PMVHaven_test",
       "type": 3,
       "api": "./pmvhaven_fongmi.py",
       "searchable": 1,
