@@ -571,15 +571,15 @@ class Spider(BaseSpider):
             self.hls_cache = {}
 
         if not video_id:
+            self.hls_diagnostic = "缺少视频 ID"
             return "", []
-
-        # hlsEnabled 可能来自较早的列表缓存；以实际播放列表为准。
 
         now = time.time()
 
         cached = self.hls_cache.get(video_id)
 
         if cached and now - cached[0] < 600:
+            self.hls_diagnostic = "缓存：{} 个画质".format(len(cached[2]))
             return cached[1], cached[2]
 
         master_url = (
@@ -589,6 +589,7 @@ class Spider(BaseSpider):
             + "/master.m3u8"
         )
 
+        self.hls_diagnostic = "正在请求 " + master_url
         content = self._request(
             master_url,
             accept=(
@@ -596,10 +597,11 @@ class Spider(BaseSpider):
                 "application/x-mpegURL,"
                 "text/plain,*/*"
             ),
-            timeout=4
+            timeout=12
         )
 
         if not content.lstrip().startswith("#EXTM3U"):
+            self.hls_diagnostic = "请求失败：{}；响应开头：{}；hlsEnabled={!r}".format(self.last_error or "非 M3U8", repr(content[:100]), hls_enabled)
             return "", []
 
         lines = [
@@ -664,7 +666,7 @@ class Spider(BaseSpider):
             reverse=True
         )
 
-        # 仅在取得可播放变体时缓存，避免把单层/异常列表误判为多画质。
+        self.hls_diagnostic = "解析成功：{} 个画质；{}".format(len(qualities), ", ".join(q["name"] for q in qualities) or "无变体")
         self.hls_cache[video_id] = (
             now,
             master_url,
@@ -849,6 +851,8 @@ class Spider(BaseSpider):
             info
         )
 
+        content.append("HLS诊断：" + getattr(self, "hls_diagnostic", "未执行"))
+
         vod = {
             "vod_id": vod_id,
             "vod_name": title,
@@ -879,20 +883,6 @@ class Spider(BaseSpider):
                 "url": "",
                 "msg": "播放地址无效或已失效",
             }
-
-        # FongMi 多画质播放器入口：点击 HLS 自动画质时，
-        # 尝试使用已经解析出的真实变体 URL，而不是构造虚假 MP4 地址。
-        if flag == "HLS画质" and url.lower().split("?", 1)[0].endswith("/master.m3u8"):
-            video_id = U.unquote(U.urlsplit(url).path.rstrip("/").split("/")[-2])
-            master, qualities = self._get_hls_qualities(video_id)
-            if master and qualities:
-                values = [{"n": "自动", "v": master}]
-                values.extend({"n": q["name"], "v": q["url"]} for q in qualities)
-                return {
-                    "parse": 0,
-                    "url": {"values": values, "position": 0},
-                    "header": PLAY_HEADERS,
-                }
 
         return {
             "parse": 0,
