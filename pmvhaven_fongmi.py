@@ -18,9 +18,9 @@ CLOUD = (
 )
 
 UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "Mozilla/5.0 (Linux; Android 13) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/156.0.0.0 Safari/537.36"
+    "Chrome/124.0.0.0 Mobile Safari/537.36"
 )
 
 HEADERS = {
@@ -114,7 +114,7 @@ def format_views(value):
 class Spider(BaseSpider):
 
     def getName(self):
-        return "PMVHaven"
+        return "PMVHaven-403定位版"
 
     def init(self, extend=""):
         self.video_cache = {}
@@ -544,94 +544,70 @@ class Spider(BaseSpider):
     # HLS 真实画质解析
     # ========================================
 
-    def _fetch_hls_manifest(self, url):
-        """Try alternate HTTP implementations and headers; keep API requests unchanged."""
-        variants = [
-            {"User-Agent": UA, "Accept": "*/*",
-             "Origin": HOST, "Referer": HOST + "/",
-             "Accept-Language": "zh-CN,zh;q=0.9"},
-            {"User-Agent": UA, "Accept": "*/*"},
-        ]
-        errors = []
-        for headers in variants:
-            try:
-                request = R.Request(url, headers=headers)
-                with R.urlopen(request, timeout=12) as response:
-                    body = response.read(512 * 1024).decode("utf-8-sig", "replace")
-                if body.lstrip().startswith("#EXTM3U"):
-                    return body
-                errors.append("urllib: not M3U8")
-            except E.HTTPError as exc:
-                errors.append("urllib HTTP {}".format(exc.code))
-            except Exception as exc:
-                errors.append("urllib {}".format(type(exc).__name__))
-        try:
-            import requests
-            for headers in variants[:2]:
-                try:
-                    response = requests.get(url, headers=headers, timeout=12)
-                    if response.ok and response.text.lstrip().startswith("#EXTM3U"):
-                        return response.text
-                    errors.append("requests HTTP {}".format(response.status_code))
-                except Exception as exc:
-                    errors.append("requests {}".format(type(exc).__name__))
-        except ImportError:
-            pass
-        self.hls_error = "; ".join(errors[-5:])
-        return ""
-
     def _get_hls_qualities(self, video_id, hls_enabled=None, hls_status=""):
-        """Return only manifest-declared qualities, never guessed filenames."""
-        if not hasattr(self, "hls_cache"):
-            self.hls_cache = {}
-        video_id = str(video_id or "").strip()
+        # 不使用 API 的 hlsEnabled 作为跳过条件，直接检测实际播放列表。
         if not video_id:
+            self.hls_diagnostic = "缺少视频ID"
             return "", []
-        now = time.time()
-        cached = self.hls_cache.get(video_id)
-        if cached and now - cached[0] < 600:
-            return cached[1], cached[2]
-        master_url = CLOUD + "/" + U.quote(video_id, safe="") + "/master.m3u8"
-        self.hls_error = ""
-        content = "" if video_id == "68e658cd8a2e866505526905" else self._fetch_hls_manifest(master_url)
-
-        # Confirmed master playlist supplied for this specific video.
-        # Used only if the app's HTTP client gets 403. Other videos are never
-        # assigned these filenames, because their rendition IDs differ.
-        if not content and video_id == "68e658cd8a2e866505526905":
-            content = ("#EXTM3U\n"
-                "#EXT-X-STREAM-INF:BANDWIDTH=5192000,RESOLUTION=1920x1080\n"
-                "6904470f8dac444429fc9f16_1080p.m3u8\n"
-                "#EXT-X-STREAM-INF:BANDWIDTH=2928000,RESOLUTION=1280x720\n"
-                "6904470f8dac444429fc9f16_720p.m3u8\n"
-                "#EXT-X-STREAM-INF:BANDWIDTH=1528000,RESOLUTION=854x480\n"
-                "6904470f8dac444429fc9f16_480p.m3u8\n"
-                "#EXT-X-STREAM-INF:BANDWIDTH=896000,RESOLUTION=640x360\n"
-                "6904470f8dac444429fc9f16_360p.m3u8\n")
-            self.hls_error = "使用已确认的该视频主播放列表（网络读取失败）"
-
-        if not content:
+        master_url = CLOUD + "/" + U.quote(str(video_id), safe="") + "/master.m3u8"
+        windows_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/156.0.0.0 Safari/537.36"
+        )
+        tests = [
+            ("无Origin/Referer", {"User-Agent": windows_ua, "Accept": "*/*"}),
+            ("带Referer", {"User-Agent": windows_ua, "Accept": "*/*", "Referer": HOST + "/"}),
+            ("带Origin+Referer", {"User-Agent": windows_ua, "Accept": "*/*", "Referer": HOST + "/", "Origin": HOST}),
+        ]
+        logs = []
+        manifest = ""
+        for label, headers in tests:
+            try:
+                req = R.Request(master_url, headers=headers, method="GET")
+                with R.urlopen(req, timeout=10) as resp:
+                    data = resp.read(512 * 1024)
+                    manifest = data.decode("utf-8-sig", "replace")
+                    logs.append("{}: HTTP {}；最终URL={}；Content-Type={}；开头={}".format(
+                        label, resp.status, resp.geturl(), resp.headers.get("Content-Type", ""), repr(manifest[:100])))
+                if manifest.lstrip().startswith("#EXTM3U"):
+                    break
+                manifest = ""
+            except E.HTTPError as exc:
+                try:
+                    body = exc.read(350).decode("utf-8", "replace")
+                except Exception:
+                    body = "无法读取响应正文"
+                logs.append("{}: HTTP {}；最终URL={}；Server={}；正文={}".format(
+                    label, exc.code, exc.geturl(), exc.headers.get("Server", ""), repr(body)))
+            except Exception as exc:
+                logs.append("{}: {}: {}".format(label, type(exc).__name__, str(exc)))
+        self.hls_diagnostic = " | ".join(logs)
+        self.hls_master_url = master_url
+        if not manifest:
             return "", []
-        lines = [line.strip() for line in content.splitlines()]
-        qualities, seen = [], set()
+        lines = [x.strip() for x in manifest.splitlines()]
+        qualities = []
+        seen = set()
         for index, line in enumerate(lines):
             if not line.startswith("#EXT-X-STREAM-INF:"):
                 continue
-            match = re.search(r"RESOLUTION\s*=\s*(\d+)x(\d+)", line, re.I)
-            if not match:
+            m = re.search(r"RESOLUTION\s*=\s*(\d+)x(\d+)", line, re.I)
+            if not m:
                 continue
-            height = int(match.group(2))
-            for candidate in lines[index + 1:]:
-                if not candidate or candidate.startswith("#"):
+            height = int(m.group(2))
+            for item in lines[index + 1:]:
+                if item.startswith("#EXT-X-STREAM-INF:"):
+                    break
+                if not item or item.startswith("#"):
                     continue
-                stream_url = U.urljoin(master_url, candidate)
-                if height not in seen and stream_url.startswith(("http://", "https://")):
-                    qualities.append({"name": "{}P".format(height),
-                                      "url": stream_url, "height": height})
+                full = U.urljoin(master_url, item)
+                if height not in seen and full.startswith(("https://", "http://")):
                     seen.add(height)
+                    qualities.append({"name": "{}P".format(height), "url": full, "height": height})
                 break
-        qualities.sort(key=lambda item: item["height"], reverse=True)
-        self.hls_cache[video_id] = (now, master_url, qualities)
+        qualities.sort(key=lambda x: x["height"], reverse=True)
+        self.hls_diagnostic += " | 解析画质=" + ",".join(x["name"] for x in qualities)
         return master_url, qualities
 
     # ========================================
@@ -730,7 +706,7 @@ class Spider(BaseSpider):
         tags = info.get("tags", [])
         stars = info.get("starsTags", [])
 
-        content = ["脚本版本：2026-10-30 画质选集验证版"]
+        content = []
 
         # 作者可点击。
         if uploader_id:
@@ -809,10 +785,9 @@ class Spider(BaseSpider):
         play_from, play_url = self._build_play_sources(
             info
         )
-        content.append("画质线路：" + (play_from or "无"))
-        content.append("HLS诊断：" + (getattr(self, "hls_error", "") or "无请求错误"))
-        if getattr(self, "hls_error", ""):
-            content.append("HLS请求：" + self.hls_error)
+        content.append("实际视频ID：" + str(info.get("_id")))
+        content.append("HLS请求URL：" + getattr(self, "hls_master_url", "未生成"))
+        content.append("HLS诊断：" + getattr(self, "hls_diagnostic", "未执行"))
 
         vod = {
             "vod_id": vod_id,
