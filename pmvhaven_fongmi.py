@@ -1,33 +1,21 @@
 
 # -*- coding: utf-8 -*-
-"""
-PMVHaven - FongMi Python Spider
 
-功能：
-1. 所有视频、热门视频、最受欢迎
-2. 真实 API 分页
-3. 关键词搜索
-4. 点击作者查看作者视频
-5. 点击标签查看标签视频
-6. 横版 16:9 封面
-7. 视频标题、时长、播放量
-8. 直接 MP4 播放
-9. 不显示推荐分类和相关推荐
-
-依赖：Python 标准库 + FongMi base.spider
-"""
-
+import re
 import json
 import base64
-import re
 import urllib.parse as U
 import urllib.request as R
-import urllib.error
 
 from base.spider import Spider as BaseSpider
 
 
 HOST = "https://pmvhaven.com"
+
+CLOUD = (
+    "https://pmvhavencloud."
+    "s3.eu-west-par.io.cloud.ovh.net"
+)
 
 UA = (
     "Mozilla/5.0 (Linux; Android 13) "
@@ -41,6 +29,11 @@ HEADERS = {
     "Origin": HOST,
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
+PLAY_HEADERS = {
+    "User-Agent": UA,
+    "Referer": HOST + "/",
 }
 
 CATEGORIES = {
@@ -68,45 +61,61 @@ def safe_page(value):
 
 
 def encode_data(data):
-    """将视频元数据编码进 vod_id，避免跨页面丢失播放地址。"""
     raw = json.dumps(
         data,
         ensure_ascii=False,
         separators=(",", ":")
     ).encode("utf-8")
 
-    return base64.urlsafe_b64encode(raw).decode(
-        "ascii"
-    ).rstrip("=")
+    return base64.urlsafe_b64encode(
+        raw
+    ).decode("ascii").rstrip("=")
 
 
 def decode_data(value):
     try:
         value = str(value)
-        padding = "=" * (-len(value) % 4)
+        value += "=" * (-len(value) % 4)
+
         raw = base64.urlsafe_b64decode(
-            (value + padding).encode("ascii")
+            value.encode("ascii")
         )
-        result = json.loads(raw.decode("utf-8"))
+
+        result = json.loads(
+            raw.decode("utf-8")
+        )
+
         return result if isinstance(result, dict) else {}
+
     except Exception:
         return {}
+
+
+def clean_text(value):
+    return re.sub(
+        r"[$#\r\n]",
+        " ",
+        str(value or "")
+    ).strip()
 
 
 def format_views(value):
     try:
         value = int(value)
-    except (ValueError, TypeError):
+    except (TypeError, ValueError):
         return "0"
 
+    if value >= 100000000:
+        return "{:.1f}亿".format(
+            value / 100000000
+        )
+
     if value >= 10000:
-        return "{:.1f}万".format(value / 10000)
+        return "{:.1f}万".format(
+            value / 10000
+        )
 
     return str(value)
-
-
-def clean_name(value):
-    return re.sub(r"[$#\r\n]", " ", str(value or "")).strip()
 
 
 class Spider(BaseSpider):
@@ -116,6 +125,7 @@ class Spider(BaseSpider):
 
     def init(self, extend=""):
         self.video_cache = {}
+        self.hls_cache = {}
         self.last_error = ""
 
     def destroy(self):
@@ -124,7 +134,7 @@ class Spider(BaseSpider):
     def isVideoFormat(self, url):
         return bool(
             re.search(
-                r"\.(?:mp4|m3u8)(?:\?|$)",
+                r"\.(mp4|m3u8)(\?|$)",
                 str(url),
                 re.I
             )
@@ -133,83 +143,160 @@ class Spider(BaseSpider):
     def manualVideoCheck(self):
         return False
 
-    def _request_json(self, url):
-        req = R.Request(url, headers=HEADERS)
+    # =========================================
+    # HTTP
+    # =========================================
+
+    def _request(self, url, accept=None):
+        headers = dict(HEADERS)
+
+        if accept:
+            headers["Accept"] = accept
+
+        req = R.Request(
+            url,
+            headers=headers
+        )
 
         try:
-            with R.urlopen(req, timeout=20) as response:
-                body = response.read().decode(
-                    "utf-8", "replace"
-                )
+            with R.urlopen(
+                req,
+                timeout=15
+            ) as response:
 
-            data = json.loads(body)
-
-            if not isinstance(data, dict):
-                self.last_error = "接口返回格式错误"
-                return None
-
-            if data.get("success") is False:
-                self.last_error = str(
-                    data.get("message", "接口请求失败")
-                )
-                return None
+                content = response.read()
 
             self.last_error = ""
-            return data
+
+            return content.decode(
+                "utf-8",
+                "replace"
+            )
 
         except Exception as e:
             self.last_error = str(e)
-            return None
+            return ""
+
+    def _request_json(self, url):
+        text = self._request(url)
+
+        if not text:
+            return {}
+
+        try:
+            data = json.loads(text)
+
+            if isinstance(data, dict):
+                return data
+
+        except Exception:
+            pass
+
+        return {}
+
+    # =========================================
+    # 视频信息
+    # =========================================
 
     def _video_info(self, video):
-        """从真实 JSON 中提取视频元数据。"""
         if not isinstance(video, dict):
             return None
 
-        vid = str(video.get("_id") or "").strip()
-        title = str(video.get("title") or "").strip()
+        vid = str(
+            video.get("_id") or ""
+        ).strip()
+
+        title = clean_text(
+            video.get("title")
+        )
 
         if not vid or not title:
             return None
 
-        sizes = video.get("thumbnailSizes") or {}
+        sizes = (
+            video.get("thumbnailSizes")
+            or {}
+        )
+
         lg = sizes.get("lg") or {}
 
         pic = (
             video.get("thumbnailUrl")
             or lg.get("url")
-            or ""
+            or (
+                CLOUD
+                + "/thumbnails/"
+                + vid
+                + "/thumb_lg.webp"
+            )
         )
 
-        if not pic:
-            pic = (
-                "https://pmvhavencloud."
-                "s3.eu-west-par.io.cloud.ovh.net/"
-                "thumbnails/{}/thumb_lg.webp"
-            ).format(vid)
+        tags = video.get("tags") or []
 
-        return {
+        if not isinstance(tags, list):
+            tags = []
+
+        stars = (
+            video.get("starsTags")
+            or []
+        )
+
+        if not isinstance(stars, list):
+            stars = []
+
+        info = {
             "_id": vid,
             "title": title,
-            "videoUrl": video.get("videoUrl") or "",
             "thumbnailUrl": pic,
+            "videoUrl": (
+                video.get("videoUrl")
+                or ""
+            ),
             "uploaderId": str(
-                video.get("uploaderId") or ""
+                video.get("uploaderId")
+                or ""
             ),
             "uploaderUsername": (
                 video.get("uploaderUsername")
                 or video.get("uploader")
                 or ""
             ),
-            "tags": video.get("tags") or [],
-            "starsTags": video.get("starsTags") or [],
-            "duration": video.get("duration") or "",
-            "views": video.get("views") or 0,
-            "likes": video.get("likes") or 0,
-            "releaseDate": video.get("releaseDate") or "",
-            "width": video.get("width") or 0,
-            "height": video.get("height") or 0,
+            "tags": tags,
+            "starsTags": stars,
+            "duration": (
+                video.get("duration")
+                or ""
+            ),
+            "views": (
+                video.get("views")
+                or 0
+            ),
+            "likes": (
+                video.get("likes")
+                or 0
+            ),
+            "releaseDate": (
+                video.get("releaseDate")
+                or ""
+            ),
+            "width": (
+                video.get("width")
+                or 0
+            ),
+            "height": (
+                video.get("height")
+                or 0
+            ),
+            "hlsEnabled": (
+                video.get("hlsEnabled")
+            ),
+            "hlsStatus": (
+                video.get("hlsStatus")
+                or ""
+            ),
         }
+
+        return info
 
     def _to_card(self, video):
         info = self._video_info(video)
@@ -217,23 +304,31 @@ class Spider(BaseSpider):
         if not info:
             return None
 
-        vid = info["_id"]
-
         if not hasattr(self, "video_cache"):
             self.video_cache = {}
 
+        vid = info["_id"]
+
         self.video_cache[vid] = info
 
-        # 使用编码后的元数据，避免进入详情页后
-        # 必须再次请求视频接口。
-        vod_id = "pmv:" + encode_data(info)
+        vod_id = (
+            "pmv:"
+            + encode_data(info)
+        )
 
         duration = info["duration"]
-        views = format_views(info["views"])
 
-        remarks = "{} | {}播放".format(
-            duration, views
-        ) if duration else "{}播放".format(views)
+        remarks = (
+            format_views(info["views"])
+            + "播放"
+        )
+
+        if duration:
+            remarks = (
+                str(duration)
+                + " | "
+                + remarks
+            )
 
         return {
             "vod_id": vod_id,
@@ -242,89 +337,96 @@ class Spider(BaseSpider):
             "vod_remarks": remarks,
             "style": {
                 "type": "rect",
-                "ratio": 1.78
+                "ratio": 1.78,
             }
         }
 
+    # =========================================
+    # 统一列表解析
+    # =========================================
+
     def _parse_list(self, data, page, limit):
-        """统一处理六种列表接口。"""
-        empty = {
-            "list": [],
-            "page": page,
-            "pagecount": page,
-            "limit": limit,
-            "total": 0,
-        }
-
-        if not isinstance(data, dict):
-            return empty
-
         videos = data.get("videos")
 
-        # 兼容部分接口将列表包在 data 内的情况。
+        pagination = (
+            data.get("pagination")
+            or {}
+        )
+
         if not isinstance(videos, list):
             nested = data.get("data")
+
             if isinstance(nested, dict):
                 videos = nested.get("videos")
 
+                pagination = (
+                    nested.get("pagination")
+                    or pagination
+                )
+
         if not isinstance(videos, list):
-            return empty
+            videos = []
+
+        if not isinstance(pagination, dict):
+            pagination = {}
 
         items = []
         seen = set()
 
         for video in videos:
+            if not isinstance(video, dict):
+                continue
+
+            vid = str(
+                video.get("_id")
+                or ""
+            )
+
+            if not vid or vid in seen:
+                continue
+
             card = self._to_card(video)
 
-            if not card:
-                continue
+            if card:
+                seen.add(vid)
+                items.append(card)
 
-            vid = str(video.get("_id") or "")
-
-            if vid in seen:
-                continue
-
-            seen.add(vid)
-            items.append(card)
-
-        pagination = data.get("pagination") or {}
-
-        if not pagination:
-            nested = data.get("data")
-            if isinstance(nested, dict):
-                pagination = (
-                    nested.get("pagination") or {}
-                )
-
-        if not isinstance(pagination, dict):
-            pagination = {}
-
-        has_next = pagination.get("hasNext")
-        total_pages = pagination.get("totalPages")
+        has_next = pagination.get(
+            "hasNext"
+        )
 
         try:
-            total_pages = int(total_pages)
-        except (TypeError, ValueError):
+            total_pages = int(
+                pagination.get("totalPages")
+                or 0
+            )
+        except Exception:
             total_pages = 0
 
         if has_next is None:
             if total_pages:
-                has_next = page < total_pages
+                has_next = (
+                    page < total_pages
+                )
             else:
-                has_next = len(videos) >= limit
+                has_next = (
+                    len(videos) >= limit
+                )
 
         if has_next:
             pagecount = max(
-                page + 1, total_pages
+                page + 1,
+                total_pages
             )
         else:
             pagecount = page
 
         try:
             total = int(
-                pagination.get("total") or 0
+                pagination.get("total")
+                or 0
             )
-        except (TypeError, ValueError):
+        except Exception:
             total = 0
 
         return {
@@ -335,45 +437,65 @@ class Spider(BaseSpider):
             "total": total,
         }
 
-    def _api_list(self, path, params, page, limit):
+    def _api_list(
+        self,
+        path,
+        params,
+        page,
+        limit
+    ):
         url = (
-            HOST + path + "?"
+            HOST
+            + path
+            + "?"
             + U.urlencode(params)
         )
 
         data = self._request_json(url)
 
         return self._parse_list(
-            data, page, limit
+            data,
+            page,
+            limit
         )
+
+    # =========================================
+    # 首页
+    # =========================================
 
     def homeContent(self, filter):
         return {
             "class": [
                 {
                     "type_id": "all",
-                    "type_name": "所有视频"
+                    "type_name": "所有视频",
                 },
                 {
                     "type_id": "trending",
-                    "type_name": "热门视频"
+                    "type_name": "热门视频",
                 },
                 {
                     "type_id": "popular",
-                    "type_name": "最受欢迎"
-                }
+                    "type_name": "最受欢迎",
+                },
             ]
         }
 
     def homeVideoContent(self):
-        result = self._category_videos(
-            "all", 1
-        )
+        # 不再提供首页推荐视频。
         return {
-            "list": result.get("list", [])
+            "list": []
         }
 
-    def _category_videos(self, category, page):
+    # =========================================
+    # 分类列表
+    # =========================================
+
+    def _category_videos(
+        self,
+        category,
+        page
+    ):
         config = CATEGORIES.get(
             category,
             CATEGORIES["all"]
@@ -400,7 +522,15 @@ class Spider(BaseSpider):
             limit
         )
 
-    def _author_videos(self, uploader_id, page):
+    # =========================================
+    # 作者列表
+    # =========================================
+
+    def _author_videos(
+        self,
+        uploader_id,
+        page
+    ):
         limit = 100
 
         params = {
@@ -416,7 +546,15 @@ class Spider(BaseSpider):
             limit
         )
 
-    def _tag_videos(self, tag, page):
+    # =========================================
+    # 标签列表
+    # =========================================
+
+    def _tag_videos(
+        self,
+        tag,
+        page
+    ):
         limit = 32
 
         params = {
@@ -434,21 +572,38 @@ class Spider(BaseSpider):
             limit
         )
 
-    def categoryContent(self, tid, pg, filter, extend):
+    def categoryContent(
+        self,
+        tid,
+        pg,
+        filter,
+        extend
+    ):
         page = safe_page(pg)
-        tid = str(tid or "all")
+
+        tid = str(
+            tid or "all"
+        )
 
         if tid.startswith("author:"):
-            uploader_id = tid.split(":", 1)[1]
+            uploader_id = tid.split(
+                ":", 1
+            )[1]
+
             return self._author_videos(
-                uploader_id, page
+                uploader_id,
+                page
             )
 
         if tid.startswith("tag:"):
             tag = U.unquote(
                 tid.split(":", 1)[1]
             )
-            return self._tag_videos(tag, page)
+
+            return self._tag_videos(
+                tag,
+                page
+            )
 
         aliases = {
             "/browse": "all",
@@ -456,24 +611,40 @@ class Spider(BaseSpider):
             "/popular": "popular",
         }
 
-        tid = aliases.get(tid, tid)
-
-        return self._category_videos(
-            tid, page
+        tid = aliases.get(
+            tid,
+            tid
         )
 
-    def searchContent(self, key, quick, pg="1"):
-        page = safe_page(pg)
-        limit = 32
+        return self._category_videos(
+            tid,
+            page
+        )
 
-        key = str(key or "").strip()
+    # =========================================
+    # 搜索
+    # =========================================
+
+    def searchContent(
+        self,
+        key,
+        quick,
+        pg="1"
+    ):
+        page = safe_page(pg)
+
+        key = str(
+            key or ""
+        ).strip()
 
         if not key:
             return {
                 "list": [],
                 "page": page,
-                "pagecount": page
+                "pagecount": page,
             }
+
+        limit = 32
 
         params = {
             "limit": limit,
@@ -488,28 +659,50 @@ class Spider(BaseSpider):
             limit
         )
 
+    # =========================================
+    # 视频 ID 解析
+    # =========================================
+
     def _read_video_id(self, vod_id):
-        vod_id = str(vod_id or "")
+        vod_id = str(
+            vod_id or ""
+        )
 
         if vod_id.startswith("pmv:"):
-            info = decode_data(vod_id[4:])
+            info = decode_data(
+                vod_id[4:]
+            )
 
             if info.get("_id"):
                 return info
 
-        # 兼容纯视频 ID。
         if re.fullmatch(
-            r"[0-9a-fA-F]{24}", vod_id
+            r"[0-9a-fA-F]{24}",
+            vod_id
         ):
-            return getattr(
-                self, "video_cache", {}
-            ).get(vod_id, {})
+            cache = getattr(
+                self,
+                "video_cache",
+                {}
+            )
+
+            return cache.get(
+                vod_id,
+                {}
+            )
 
         return {}
 
-    def _entity_link(self, name, target):
-        """生成 FongMi 可点击的分类链接。"""
-        name = clean_name(name)
+    # =========================================
+    # FongMi 可点击链接
+    # =========================================
+
+    def _entity_link(
+        self,
+        name,
+        target
+    ):
+        name = clean_text(name)
 
         if not name:
             return ""
@@ -521,18 +714,245 @@ class Spider(BaseSpider):
         }
 
         try:
-            return self.link(name, payload)
+            return self.link(
+                name,
+                payload
+            )
         except Exception:
             return name
+
+    # =========================================
+    # HLS 多画质解析
+    # =========================================
+
+    def _get_hls_qualities(
+        self,
+        video_id,
+        hls_enabled=None,
+        hls_status=""
+    ):
+        """
+        返回：
+        master_url, qualities
+
+        qualities 示例：
+        [
+            {
+                "name": "1080P",
+                "url": "...1080p.m3u8",
+                "height": 1080
+            }
+        ]
+        """
+
+        if not hasattr(
+            self,
+            "hls_cache"
+        ):
+            self.hls_cache = {}
+
+        if video_id in self.hls_cache:
+            return self.hls_cache[
+                video_id
+            ]
+
+        master_url = (
+            CLOUD
+            + "/"
+            + video_id
+            + "/master.m3u8"
+        )
+
+        # 明确未启用 HLS 时跳过。
+        if hls_enabled is False:
+            result = ("", [])
+            self.hls_cache[
+                video_id
+            ] = result
+            return result
+
+        content = self._request(
+            master_url,
+            accept=(
+                "application/vnd.apple.mpegurl,"
+                "application/x-mpegURL,"
+                "text/plain,*/*"
+            )
+        )
+
+        if not content.startswith(
+            "#EXTM3U"
+        ):
+            result = ("", [])
+            self.hls_cache[
+                video_id
+            ] = result
+            return result
+
+        lines = [
+            line.strip()
+            for line in content.splitlines()
+        ]
+
+        qualities = []
+
+        for index, line in enumerate(lines):
+            if not line.startswith(
+                "#EXT-X-STREAM-INF:"
+            ):
+                continue
+
+            match = re.search(
+                r"RESOLUTION=(\d+)x(\d+)",
+                line
+            )
+
+            if not match:
+                continue
+
+            height = int(
+                match.group(2)
+            )
+
+            # 读取该画质对应的实际文件名。
+            for next_line in lines[index + 1:]:
+                if not next_line:
+                    continue
+
+                if next_line.startswith("#"):
+                    continue
+
+                stream_url = U.urljoin(
+                    master_url,
+                    next_line
+                )
+
+                qualities.append({
+                    "name": "{}P".format(
+                        height
+                    ),
+                    "url": stream_url,
+                    "height": height,
+                })
+
+                break
+
+        # 高画质优先。
+        qualities.sort(
+            key=lambda x: x["height"],
+            reverse=True
+        )
+
+        unique = []
+        seen = set()
+
+        for item in qualities:
+            if item["name"] in seen:
+                continue
+
+            seen.add(
+                item["name"]
+            )
+
+            unique.append(item)
+
+        result = (
+            master_url,
+            unique
+        )
+
+        self.hls_cache[
+            video_id
+        ] = result
+
+        return result
+
+    # =========================================
+    # 构造播放线路
+    # =========================================
+
+    def _build_play_sources(self, info):
+        video_id = info.get(
+            "_id", ""
+        )
+
+        mp4 = info.get(
+            "videoUrl", ""
+        )
+
+        hls_enabled = info.get(
+            "hlsEnabled"
+        )
+
+        hls_status = info.get(
+            "hlsStatus", ""
+        )
+
+        master_url, qualities = (
+            self._get_hls_qualities(
+                video_id,
+                hls_enabled,
+                hls_status
+            )
+        )
+
+        play_from = []
+        play_urls = []
+
+        # 真实 HLS 主列表。
+        if master_url:
+            play_from.append(
+                "自动画质"
+            )
+
+            play_urls.append(
+                "自动播放$"
+                + master_url
+            )
+
+            # 只有实际存在的画质才显示。
+            for quality in qualities:
+                name = quality["name"]
+                url = quality["url"]
+
+                play_from.append(name)
+
+                play_urls.append(
+                    name + "$" + url
+                )
+
+        # 原始 MP4 备用。
+        if mp4:
+            play_from.append(
+                "原始MP4"
+            )
+
+            play_urls.append(
+                "原始播放$" + mp4
+            )
+
+        return (
+            "$$$".join(play_from),
+            "$$$".join(play_urls)
+        )
+
+    # =========================================
+    # 视频详情
+    # =========================================
 
     def detailContent(self, ids):
         vod_id = (
             ids[0]
-            if isinstance(ids, (list, tuple))
+            if isinstance(
+                ids,
+                (list, tuple)
+            )
             else ids
         )
 
-        info = self._read_video_id(vod_id)
+        info = self._read_video_id(
+            vod_id
+        )
 
         if not info:
             return {
@@ -540,33 +960,45 @@ class Spider(BaseSpider):
                     "vod_id": vod_id,
                     "vod_name": "视频信息不可用",
                     "vod_content": (
-                        "无法从视频 ID 还原播放信息，"
+                        "无法获取视频信息，"
                         "请从分类或搜索列表重新进入。"
-                    )
+                    ),
                 }]
             }
 
-        title = info.get("title") or "未知标题"
-        pic = info.get("thumbnailUrl") or ""
-        mp4 = info.get("videoUrl") or ""
+        title = info.get(
+            "title", ""
+        )
+
+        pic = info.get(
+            "thumbnailUrl", ""
+        )
 
         uploader = info.get(
             "uploaderUsername"
         ) or "未知作者"
 
         uploader_id = info.get(
-            "uploaderId"
-        ) or ""
+            "uploaderId", ""
+        )
 
-        tags = info.get("tags") or []
+        tags = info.get(
+            "tags", []
+        )
+
+        stars = info.get(
+            "starsTags", []
+        )
 
         content = []
 
+        # 作者可点击。
         if uploader_id:
             author_link = self._entity_link(
                 uploader,
                 "author:" + uploader_id
             )
+
             content.append(
                 "作者：" + author_link
             )
@@ -575,80 +1007,104 @@ class Spider(BaseSpider):
                 "作者：" + uploader
             )
 
+        # 标签可点击。
         if tags:
             tag_links = []
 
             for tag in tags:
-                tag = str(tag).strip()
+                tag = str(
+                    tag
+                ).strip()
 
                 if not tag:
                     continue
 
-                tag_links.append(
-                    self._entity_link(
+                target = (
+                    "tag:"
+                    + U.quote(
                         tag,
-                        "tag:" + U.quote(
-                            tag, safe=""
-                        )
+                        safe=""
                     )
                 )
 
-            content.append(
-                "标签：" + "、".join(tag_links)
-            )
+                tag_links.append(
+                    self._entity_link(
+                        tag,
+                        target
+                    )
+                )
 
-        stars = info.get("starsTags") or []
+            if tag_links:
+                content.append(
+                    "标签："
+                    + "、".join(tag_links)
+                )
 
         if stars:
             content.append(
-                "人物：" + "、".join(
-                    str(x) for x in stars
+                "人物："
+                + "、".join(
+                    str(x)
+                    for x in stars
                 )
             )
 
-        duration = info.get("duration")
+        duration = info.get(
+            "duration", ""
+        )
 
         if duration:
             content.append(
-                "时长：" + str(duration)
+                "时长："
+                + str(duration)
             )
 
         content.append(
-            "播放量：" + str(
+            "播放量："
+            + str(
                 info.get("views", 0)
             )
         )
 
         content.append(
-            "点赞数：" + str(
+            "点赞数："
+            + str(
                 info.get("likes", 0)
             )
         )
 
-        width = info.get("width", 0)
-        height = info.get("height", 0)
+        width = info.get(
+            "width", 0
+        )
+
+        height = info.get(
+            "height", 0
+        )
 
         if width and height:
             content.append(
-                "分辨率：{}×{}".format(
-                    width, height
+                "原始分辨率："
+                + "{}×{}".format(
+                    width,
+                    height
                 )
             )
 
-        date = info.get("releaseDate") or ""
+        date = info.get(
+            "releaseDate", ""
+        )
 
         if date:
             content.append(
-                "发布日期：" + date[:10]
+                "发布日期："
+                + date[:10]
             )
 
-        # 只添加当前视频，不添加相关推荐。
-        if mp4:
-            play_url = (
-                "在线播放$" + mp4
+        play_from, play_url = (
+            self._build_play_sources(
+                info
             )
-        else:
-            play_url = ""
+        )
 
         vod = {
             "vod_id": vod_id,
@@ -656,10 +1112,10 @@ class Spider(BaseSpider):
             "vod_pic": pic,
             "vod_actor": uploader,
             "vod_director": uploader,
-            "vod_content": "\n".join(content),
-            "vod_play_from": (
-                "PMVHaven" if mp4 else ""
+            "vod_content": "\n".join(
+                content
             ),
+            "vod_play_from": play_from,
             "vod_play_url": play_url,
         }
 
@@ -667,15 +1123,31 @@ class Spider(BaseSpider):
             "list": [vod]
         }
 
-    def playerContent(self, flag, id, vipFlags):
-        url = str(id or "").strip()
+    # =========================================
+    # 播放器
+    # =========================================
+
+    def playerContent(
+        self,
+        flag,
+        id,
+        vipFlags
+    ):
+        url = str(
+            id or ""
+        ).strip()
 
         if url.startswith("pmv:"):
-            info = self._read_video_id(url)
-            url = info.get("videoUrl") or ""
+            info = self._read_video_id(
+                url
+            )
+
+            url = info.get(
+                "videoUrl", ""
+            )
 
         if not url.startswith(
-            ("https://", "http://")
+            ("http://", "https://")
         ):
             return {
                 "parse": 1,
@@ -685,11 +1157,7 @@ class Spider(BaseSpider):
         return {
             "parse": 0,
             "url": url,
-            "header": {
-                "User-Agent": UA,
-                "Referer": HOST + "/",
-                "Origin": HOST,
-            }
+            "header": PLAY_HEADERS,
         }
 
     def localProxy(self, param):
