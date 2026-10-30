@@ -623,53 +623,11 @@ class Spider(BaseSpider):
     # ========================================
 
     def _build_play_sources(self, info):
-        """
-        FongMi 播放格式：
-
-        vod_play_from:
-            HLS画质$$$原始MP4
-
-        vod_play_url:
-            自动画质$url#1080P$url#720P$url
-            $$$
-            原始播放$mp4_url
-
-        #   分隔同一线路的播放项
-        $$$ 分隔不同播放线路
-        """
-
+        """只使用 API 返回的原始 MP4 地址，不请求 HLS。"""
         mp4 = str(info.get("videoUrl") or "").strip()
-
-        master_url, qualities = self._get_hls_qualities(mp4)
-
-        play_from = []
-        play_urls = []
-
-        # HLS 线路：一个线路包含所有真实画质。
-        if master_url:
-            entries = [
-                "自动画质$" + master_url
-            ]
-
-            for quality in qualities:
-                entries.append(
-                    quality["name"]
-                    + "$"
-                    + quality["url"]
-                )
-
-            play_from.append("HLS画质")
-            play_urls.append("#".join(entries))
-
-        # MP4 独立备用线路。
         if mp4.startswith(("https://", "http://")):
-            play_from.append("原始MP4")
-            play_urls.append("原始播放$" + mp4)
-
-        return (
-            "$$$".join(play_from),
-            "$$$".join(play_urls)
-        )
+            return "原始MP4", "原始播放$" + mp4
+        return "", ""
 
     # ========================================
     # 视频详情
@@ -788,7 +746,6 @@ class Spider(BaseSpider):
         play_from, play_url = self._build_play_sources(
             info
         )
-        content.append("HLS诊断：" + str(getattr(self, "hls_diagnostic", "未执行")))
 
         vod = {
             "vod_id": vod_id,
