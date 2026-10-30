@@ -700,16 +700,48 @@ def check_full_hls(url, referer, expected):
 
 
 def ordered_media(definitions, quality='auto'):
-    """Preserve original v26 selection ordering."""
+    """Prefer 1080p for automatic playback, with HLS masters checked first."""
     items = list(definitions or [])
-    target = quality_number(quality) if quality != 'auto' else 0
-    if target:
-        items.sort(key=lambda d: (abs(d['quality'] - target) if d['quality'] else 9999,
-                                  not d['default']))
-    else:
-        items.sort(key=lambda d: (not d['default'], d['master'],
-                                  abs(d['quality'] - 720) if d['quality'] else 9999))
+    target = quality_number(quality) if quality != 'auto' else 1080
+
+    def rank(d):
+        q = d.get('quality') or 0
+        # Master playlists can contain a genuine 1080p variant even if their
+        # advertised quality is a list. Inspect them before lower tiers.
+        if d.get('master'):
+            return (0, 0, 0)
+        if q == target:
+            return (1, 0, 0)
+        if q < target:
+            return (2, target - q, -q)
+        return (3, q - target, q)
+
+    items.sort(key=rank)
     return items
+
+
+def select_hls_quality(media_url, referer, quality='auto'):
+    """Resolve a master playlist to an actual quality-specific variant URL.
+
+    Do not invent a URL or claim a 1080p rendition exists without an
+    EXT-X-STREAM-INF entry advertising its resolution.
+    """
+    content = fetch_playlist(media_url, referer)
+    if not content:
+        return media_url  # Preserve old behavior if playlist inspection fails.
+    variants = playlist_variants(media_url, content, referer)
+    if not variants:
+        return media_url  # Already a media playlist, or no variant metadata.
+    target = quality_number(quality) if quality != 'auto' else 1080
+    known = [(h, u) for h, u in variants if h > 0]
+    if not known:
+        return media_url  # Let the player perform adaptive selection.
+    # Exact match, then best lower rendition, then smallest higher rendition.
+    known.sort(key=lambda x: (0 if x[0] == target else
+                              1 if x[0] < target else 2,
+                              target - x[0] if x[0] < target else
+                              x[0] - target))
+    return known[0][1]
 
 
 def usable_hls(url, created=0):
@@ -931,6 +963,9 @@ class Spider(BaseSpider):
                 if not definitions:
                     return {'parse': 0, 'url': '', 'msg': '当前页面未提供 HLS 正片源'}
                 media_url = definitions[0]['url']
+            # Resolve adaptive master to a concrete 1080p rendition when
+            # present; this prevents FongMi from auto-dropping to 720p.
+            media_url = select_hls_quality(media_url, page, quality)
             return {'parse': 0, 'url': media_url, 'header': {
                 'User-Agent': HEADERS['User-Agent'],
                 'Referer': page,
