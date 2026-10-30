@@ -137,7 +137,7 @@ class Spider(BaseSpider):
     # HTTP 请求
     # ========================================
 
-    def _request(self, url, accept=None, timeout=15):
+    def _request(self, url, accept=None, timeout=30):
         headers = dict(HEADERS)
 
         if accept:
