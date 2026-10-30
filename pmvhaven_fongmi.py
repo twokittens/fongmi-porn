@@ -1,5 +1,19 @@
 
-# coding: utf-8
+# -*- coding: utf-8 -*-
+"""
+PMVHaven FongMi Python Spider
+
+功能：
+1. 横版视频封面（16:9）
+2. 正确提取视频标题
+3. 过滤作者头像
+4. 所有视频 / 热门视频 / 最受欢迎
+5. 搜索与分页
+6. 创作者和标签点击跳转
+7. 1080P 优先播放
+8. 相关视频连续播放
+"""
+
 import re
 import json
 import html
@@ -13,17 +27,20 @@ except ImportError:
     class BaseSpider(object):
         pass
 
+
 HOST = "https://pmvhaven.com"
+
 UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "Mozilla/5.0 (Linux; Android 13) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+    "Chrome/120.0.0.0 Mobile Safari/537.36"
 )
 
 HEADERS = {
     "User-Agent": UA,
     "Referer": HOST + "/",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,*/*"
 }
 
 THUMB = (
@@ -31,20 +48,42 @@ THUMB = (
     "thumbnails/{}/thumb_lg.webp"
 )
 
+LANDSCAPE_STYLE = {
+    "type": "rect",
+    "ratio": 1.78
+}
+
+VIDEO_PATTERN = re.compile(
+    r"^/video/[^/?#]+_([a-fA-F0-9]{24})/?$"
+)
+
+
+# ============================================================
+# 网络请求
+# ============================================================
 
 def absolute(url):
-    return urllib.parse.urljoin(HOST, html.unescape(url or ""))
-
-
-def canonical(url):
-    p = urllib.parse.urlsplit(absolute(url))
-    return urllib.parse.urlunsplit(
-        (p.scheme, p.netloc, p.path, "", "")
+    return urllib.parse.urljoin(
+        HOST + "/",
+        html.unescape(str(url or ""))
     )
 
 
-def request(url, timeout=10, headers=None, max_bytes=3000000):
+def canonical(url):
+    parsed = urllib.parse.urlsplit(absolute(url))
+
+    return urllib.parse.urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        "",
+        ""
+    ))
+
+
+def request(url, timeout=12, headers=None, max_bytes=3000000):
     h = dict(HEADERS)
+
     if headers:
         h.update(headers)
 
@@ -57,66 +96,112 @@ def request(url, timeout=10, headers=None, max_bytes=3000000):
         return resp.read(max_bytes)
 
 
-def fetch(url, timeout=10):
-    return request(url, timeout).decode("utf-8", "replace")
+def fetch(url, timeout=12):
+    return request(
+        url,
+        timeout=timeout
+    ).decode("utf-8", "replace")
 
 
 def clean(value):
-    value = re.sub(r"<[^>]+>", " ", value or "")
+    value = re.sub(
+        r"<[^>]+>",
+        " ",
+        str(value or "")
+    )
+
     return re.sub(
-        r"\s+", " ", html.unescape(value)
+        r"\s+",
+        " ",
+        html.unescape(value)
     ).strip()
 
 
 def video_key(url):
-    slug = urllib.parse.urlsplit(url).path.rstrip("/").split("/")[-1]
-    match = re.search(r"_([a-fA-F0-9]{24})$", slug)
-    return match.group(1) if match else ""
+    path = urllib.parse.urlsplit(
+        absolute(url)
+    ).path
+
+    match = VIDEO_PATTERN.fullmatch(path)
+
+    return match.group(1).lower() if match else ""
 
 
 def thumbnail(url):
     key = video_key(url)
-    return THUMB.format(key) if key else ""
 
+    if not key:
+        return ""
+
+    return THUMB.format(key)
+
+
+def valid_video(url):
+    parsed = urllib.parse.urlsplit(absolute(url))
+
+    if parsed.hostname not in (
+        "pmvhaven.com",
+        "www.pmvhaven.com"
+    ):
+        return False
+
+    return bool(
+        VIDEO_PATTERN.fullmatch(parsed.path)
+    )
+
+
+# ============================================================
+# 视频卡片解析
+# ============================================================
 
 class CardParser(HTMLParser):
+
     def __init__(self):
-        super().__init__()
+        super().__init__(convert_charrefs=True)
+
         self.cards = []
-        self.current = None
-        self.depth = 0
+        self.stack = []
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
-        href = a.get("href", "")
-
-        if tag == "a" and "/video/" in href:
-            if self.current is not None:
-                self.finish()
-
-            self.current = {
-                "url": absolute(href),
-                "title": "",
-                "pic": "",
-                "text": ""
-            }
-            self.depth = 1
-            return
-
-        if self.current is None:
-            return
 
         if tag == "a":
-            self.depth += 1
+            href = html.unescape(
+                a.get("href", "")
+            )
 
-        if tag == "img":
+            valid = valid_video(href)
+
+            self.stack.append({
+                "valid": valid,
+                "url": canonical(href) if valid else "",
+                "title": "",
+                "pic": "",
+                "text": []
+            })
+
+            return
+
+        if tag == "img" and self.stack:
+            card = self.stack[-1]
+
+            if not card["valid"]:
+                return
+
+            key = video_key(card["url"])
+
+            if not key:
+                return
+
             sources = [
                 a.get("data-src", ""),
                 a.get("src", ""),
                 a.get("data-original", ""),
+                a.get("data-lazy-src", "")
             ]
 
             srcset = a.get("srcset", "")
+
             if srcset:
                 sources.extend(
                     x.strip().split(" ")[0]
@@ -124,35 +209,45 @@ class CardParser(HTMLParser):
                 )
 
             for src in sources:
-                if "/thumbnails/" in src:
-                    self.current["pic"] = absolute(src)
-                    if a.get("alt"):
-                        self.current["title"] = a["alt"]
-                    break
+                src = html.unescape(src)
+
+                match = re.search(
+                    r"/thumbnails/([a-fA-F0-9]{24})/"
+                    r"thumb_lg\.webp(?:\?|$)",
+                    src,
+                    re.I
+                )
+
+                if not match:
+                    continue
+
+                if match.group(1).lower() != key:
+                    continue
+
+                card["pic"] = absolute(src)
+
+                alt = clean(a.get("alt", ""))
+
+                if alt:
+                    card["title"] = alt
+
+                break
 
     def handle_data(self, data):
-        if self.current is not None:
-            self.current["text"] += data + " "
+        if self.stack:
+            self.stack[-1]["text"].append(data)
 
     def handle_endtag(self, tag):
-        if self.current is None:
+        if tag != "a":
             return
 
-        if tag == "a":
-            self.depth -= 1
-            if self.depth <= 0:
-                self.finish()
+        if not self.stack:
+            return
 
-    def finish(self):
-        if self.current:
-            self.cards.append(self.current)
-        self.current = None
-        self.depth = 0
+        card = self.stack.pop()
 
-    def close(self):
-        super().close()
-        if self.current:
-            self.finish()
+        if card["valid"] and card["pic"]:
+            self.cards.append(card)
 
 
 def parse_cards(page):
@@ -164,34 +259,45 @@ def parse_cards(page):
     seen = set()
 
     for item in parser.cards:
-        url = canonical(item["url"])
+        url = item["url"]
 
-        if url in seen:
+        if not url or url in seen:
             continue
 
         seen.add(url)
 
-        pic = item["pic"]
-
-        if "/thumbnails/" not in pic:
-            pic = thumbnail(url)
-
-        title = clean(item["title"])
-        if not title:
-            title = clean(item["text"])
+        title = item["title"]
 
         if not title:
-            title = url.rstrip("/").split("/")[-1].replace("-", " ")
+            title = clean(
+                " ".join(item["text"])
+            )
+
+        if not title:
+            slug = urllib.parse.urlsplit(
+                url
+            ).path.split("/")[-1]
+
+            title = re.sub(
+                r"_[a-fA-F0-9]{24}$",
+                "",
+                slug
+            ).replace("-", " ")
 
         result.append({
             "vod_id": url,
             "vod_name": title[:150],
-            "vod_pic": pic,
-            "vod_remarks": ""
+            "vod_pic": item["pic"],
+            "vod_remarks": "",
+            "style": dict(LANDSCAPE_STYLE)
         })
 
     return result
 
+
+# ============================================================
+# Nuxt 数据与播放地址
+# ============================================================
 
 def nuxt_strings(page):
     match = re.search(
@@ -205,68 +311,127 @@ def nuxt_strings(page):
         return []
 
     try:
-        data = json.loads(match.group(1))
+        data = json.loads(
+            match.group(1)
+        )
     except Exception:
         return []
 
-    values = []
+    result = []
 
     def walk(obj):
         if isinstance(obj, str):
-            values.append(obj)
+            result.append(obj)
+
         elif isinstance(obj, list):
-            for item in obj:
-                walk(item)
+            for value in obj:
+                walk(value)
+
         elif isinstance(obj, dict):
-            for item in obj.values():
-                walk(item)
+            for value in obj.values():
+                walk(value)
 
     walk(data)
-    return values
+
+    return result
 
 
 def extract_streams(page):
-    urls = []
+    found = []
     seen = set()
 
     for value in nuxt_strings(page):
-        value = html.unescape(value)
+        value = html.unescape(
+            value.replace("\\/", "/")
+        )
 
-        if not value.startswith(("https://", "http://")):
+        if not value.startswith(
+            ("http://", "https://")
+        ):
             continue
 
-        if not re.search(r"\.(m3u8|mp4)(?:\?|$)", value, re.I):
+        if not re.search(
+            r"\.(?:m3u8|mp4)(?:[?#]|$)",
+            value,
+            re.I
+        ):
             continue
 
         if "preview" in value.lower():
             continue
 
-        if value not in seen:
-            seen.add(value)
-            urls.append(value)
+        if value in seen:
+            continue
 
-    def priority(url):
-        match = re.search(r"(\d{3,4})p\.m3u8", url, re.I)
+        seen.add(value)
+        found.append(value)
+
+    def quality_rank(url):
+        match = re.search(
+            r"(\d{3,4})p(?:[/_.-]|$)",
+            urllib.parse.urlsplit(url).path,
+            re.I
+        )
+
         if match:
-            return (0, -int(match.group(1)))
+            return (
+                0,
+                -int(match.group(1))
+            )
 
-        if "master.m3u8" in url:
+        if "master.m3u8" in url.lower():
             return (1, 0)
 
         return (2, 0)
 
-    return sorted(urls, key=priority)
+    return sorted(
+        found,
+        key=quality_rank
+    )
 
+
+def probe_stream(url, timeout=3):
+    try:
+        if ".m3u8" in url.lower():
+            body = request(
+                url,
+                timeout=timeout,
+                max_bytes=120000
+            ).decode("utf-8", "replace")
+
+            return "#EXTM3U" in body
+
+        data = request(
+            url,
+            timeout=timeout,
+            headers={
+                "Range": "bytes=0-127"
+            },
+            max_bytes=64
+        )
+
+        return bool(data)
+
+    except Exception:
+        return False
+
+
+# ============================================================
+# 视频元数据
+# ============================================================
 
 def extract_metadata(page, url):
     title = ""
+
     match = re.search(
         r"<title[^>]*>(.*?)</title>",
         page,
         re.S | re.I
     )
+
     if match:
         title = clean(match.group(1))
+
         title = re.sub(
             r"\s*[-|]\s*PMVHaven.*$",
             "",
@@ -283,7 +448,11 @@ def extract_metadata(page, url):
         page,
         re.S | re.I
     ):
-        name = clean(label).replace(" Creator", "").strip()
+        name = clean(label).replace(
+            " Creator",
+            ""
+        ).strip()
+
         if name:
             creator = name
             creator_url = absolute(href)
@@ -307,57 +476,76 @@ def extract_metadata(page, url):
 
     pic = thumbnail(url)
 
-    for tag in re.findall(r"<meta\s+[^>]*>", page, re.I):
-        if "og:image" not in tag:
+    for meta in re.findall(
+        r"<meta\s+[^>]*>",
+        page,
+        re.I
+    ):
+        if "og:image" not in meta:
             continue
 
         match = re.search(
             r'content=["\']([^"\']+)',
-            tag,
+            meta,
             re.I
         )
 
-        if match and "/thumbnails/" in match.group(1):
-            pic = absolute(match.group(1))
-            break
+        if match:
+            candidate = absolute(
+                match.group(1)
+            )
 
-    return title, creator, creator_url, tags, pic
+            if "/thumbnails/" in candidate:
+                pic = candidate
+                break
+
+    return (
+        title,
+        creator,
+        creator_url,
+        tags,
+        pic
+    )
 
 
-def probe_playlist(url, timeout=3):
-    try:
-        body = request(
-            url,
-            timeout=timeout,
-            max_bytes=120000
-        ).decode("utf-8", "replace")
-
-        return "#EXTM3U" in body
-    except Exception:
-        return False
-
+# ============================================================
+# 连续播放
+# ============================================================
 
 def pack_episodes(items, limit=50):
     result = []
     seen = set()
 
     for item in items[:limit]:
-        url = item.get("vod_id", "")
+        url = item.get(
+            "vod_id",
+            ""
+        )
 
         if not url or url in seen:
             continue
 
         seen.add(url)
 
-        name = item.get("vod_name", "视频")
+        name = item.get(
+            "vod_name",
+            "视频"
+        )
+
         name = name.replace("$", " ")
         name = name.replace("#", " ")
         name = name.replace("$$$", " ")
 
-        result.append(name[:80] + "$" + url)
+        result.append(
+            name[:80] + "$" + url
+        )
 
     return "#".join(result)
 
+
+# ============================================================
+# Spider 主类
+# ============================================================
 
 class Spider(BaseSpider):
 
@@ -365,20 +553,82 @@ class Spider(BaseSpider):
         return "PMVHaven"
 
     def init(self, extend=""):
-        pass
+        self.last_error = ""
 
     def destroy(self):
         pass
 
     def isVideoFormat(self, url):
         return bool(re.search(
-            r"\.(m3u8|mp4)(?:\?|$)",
-            url,
+            r"\.(m3u8|mp4)(?:[?#]|$)",
+            str(url),
             re.I
         ))
 
     def manualVideoCheck(self):
         return False
+
+    # --------------------------------------------------------
+    # FongMi 网络请求
+    # --------------------------------------------------------
+
+    def _fetch(self, url, timeout=12):
+        url = absolute(url)
+
+        # 优先使用 FongMi 自带网络请求接口。
+        try:
+            response = self.net.req(
+                url,
+                {
+                    "method": "GET",
+                    "timeout": timeout * 1000,
+                    "cookie": True,
+                    "headers": HEADERS
+                }
+            )
+
+            if isinstance(response, str):
+                response = json.loads(response)
+
+            if isinstance(response, dict):
+                code = int(
+                    response.get(
+                        "code",
+                        response.get("status", 0)
+                    ) or 0
+                )
+
+                content = response.get(
+                    "content",
+                    ""
+                )
+
+                if code == 200 and content:
+                    if isinstance(content, bytes):
+                        return content.decode(
+                            "utf-8",
+                            "replace"
+                        )
+
+                    return str(content)
+
+        except Exception as error:
+            self.last_error = str(error)
+
+        # FongMi 接口不可用时使用 Python 请求。
+        try:
+            return fetch(
+                url,
+                timeout=timeout
+            )
+
+        except Exception as error:
+            self.last_error = str(error)
+            return ""
+
+    # --------------------------------------------------------
+    # 首页分类
+    # --------------------------------------------------------
 
     def homeContent(self, filter):
         return {
@@ -399,45 +649,73 @@ class Spider(BaseSpider):
         }
 
     def homeVideoContent(self):
-        try:
-            return {
-                "list": parse_cards(fetch(HOST + "/"))
-            }
-        except Exception:
-            return {"list": []}
+        page = self._fetch(
+            HOST + "/"
+        )
+
+        return {
+            "list": parse_cards(page)
+        }
+
+    # --------------------------------------------------------
+    # 分类和作者/标签作品列表
+    # --------------------------------------------------------
 
     def categoryContent(self, tid, pg, filter, extend):
         try:
-            page = max(1, int(pg))
+            page = max(
+                1,
+                int(pg)
+            )
         except Exception:
             page = 1
 
         url = absolute(tid)
 
         if page > 1:
-            separator = "&" if "?" in url else "?"
-            url += separator + "page=" + str(page)
+            separator = (
+                "&" if "?" in url else "?"
+            )
 
-        try:
-            items = parse_cards(fetch(url))
-        except Exception:
-            items = []
+            url += (
+                separator
+                + "page="
+                + str(page)
+            )
+
+        source = self._fetch(url)
+
+        items = parse_cards(source)
 
         return {
             "list": items,
             "page": page,
             "pagecount": page + 1 if items else page,
-            "limit": 30,
+            "limit": len(items) or 30,
             "total": 999999 if items else 0
         }
 
+    # --------------------------------------------------------
+    # 搜索
+    # --------------------------------------------------------
+
     def searchContent(self, key, quick, pg="1"):
         try:
-            page = max(1, int(pg))
+            page = max(
+                1,
+                int(pg)
+            )
         except Exception:
             page = 1
 
-        key = str(key)
+        key = str(key or "").strip()
+
+        if not key:
+            return {
+                "list": [],
+                "page": 1,
+                "pagecount": 1
+            }
 
         if key.startswith("标签:"):
             params = {
@@ -450,40 +728,119 @@ class Spider(BaseSpider):
                 "page": page
             }
 
-        url = HOST + "/search?" + urllib.parse.urlencode(params)
+        url = (
+            HOST
+            + "/search?"
+            + urllib.parse.urlencode(params)
+        )
 
-        try:
-            items = parse_cards(fetch(url))
-        except Exception:
-            items = []
+        source = self._fetch(url)
+
+        items = parse_cards(source)
 
         return {
             "list": items,
             "page": page,
             "pagecount": page + 1 if items else page,
-            "limit": 30,
+            "limit": len(items) or 30,
             "total": 999999 if items else 0
         }
 
-    def detailContent(self, ids):
-        if not ids:
-            return {"list": []}
+    # --------------------------------------------------------
+    # 可点击作者和标签
+    # --------------------------------------------------------
 
-        url = canonical(ids[0])
+    def _make_link(self, name, url):
+        target = {
+            "id": url,
+            "name": name,
+            "type_flag": 1
+        }
 
         try:
-            page = fetch(url, timeout=10)
+            return self.link(
+                name,
+                target
+            )
         except Exception:
-            return {"list": []}
+            return name
 
-        title, creator, creator_url, tags, pic = extract_metadata(
-            page, url
+    # --------------------------------------------------------
+    # 视频详情
+    # --------------------------------------------------------
+
+    def detailContent(self, ids):
+        if not ids:
+            return {
+                "list": []
+            }
+
+        vid = (
+            ids[0]
+            if isinstance(ids, (list, tuple))
+            else str(ids)
+        )
+
+        url = canonical(vid)
+
+        if not valid_video(url):
+            return {
+                "list": []
+            }
+
+        source = self._fetch(
+            url,
+            timeout=12
+        )
+
+        if not source:
+            return {
+                "list": [{
+                    "vod_id": url,
+                    "vod_name": "详情加载失败",
+                    "vod_content": self.last_error
+                }]
+            }
+
+        (
+            title,
+            creator,
+            creator_url,
+            tags,
+            pic
+        ) = extract_metadata(
+            source,
+            url
         )
 
         if not title:
-            title = url.rstrip("/").split("/")[-1].replace("-", " ")
+            title = (
+                urllib.parse.urlsplit(url)
+                .path.split("/")[-1]
+                .replace("-", " ")
+            )
 
-        # 当前视频始终排第一，方便连续播放和客户端预加载。
+        # 创作者点击跳转
+        creator_text = creator or "未知"
+
+        if creator and creator_url:
+            creator_text = self._make_link(
+                creator,
+                creator_url
+            )
+
+        # 标签点击跳转
+        tag_links = []
+
+        for name, tag_url in tags:
+            tag_links.append(
+                self._make_link(
+                    name,
+                    tag_url
+                )
+            )
+
+        # 当前视频和相关视频
         current = {
             "vod_id": url,
             "vod_name": title,
@@ -491,65 +848,56 @@ class Spider(BaseSpider):
         }
 
         related = [
-            item for item in parse_cards(page)
+            item
+            for item in parse_cards(source)
             if item["vod_id"] != url
         ]
 
-        sources = ["连续播放"]
-        playlists = [pack_episodes([current] + related)]
-
-        # 限制额外请求，避免详情页长时间加载。
-        if creator_url:
-            try:
-                creator_items = parse_cards(
-                    fetch(creator_url, timeout=4)
-                )
-                if creator_items:
-                    sources.append("创作者·" + creator[:20])
-                    playlists.append(pack_episodes(creator_items))
-            except Exception:
-                pass
-
-        # 最多加载前两个标签作品列表。
-        for label, tag_url in tags[:2]:
-            try:
-                tag_items = parse_cards(
-                    fetch(tag_url, timeout=4)
-                )
-
-                if tag_items:
-                    sources.append("标签·" + label[:20])
-                    playlists.append(pack_episodes(tag_items))
-            except Exception:
-                pass
+        episodes = pack_episodes(
+            [current] + related
+        )
 
         content = (
-            "创作者：" + (creator or "未知")
-            + "\n标签：" + ", ".join(t[0] for t in tags)
-            + "\n可在下方播放源切换创作者或标签作品。"
+            "标题：" + title
+            + "\n创作者：" + creator_text
+            + "\n标签：" + "、".join(tag_links)
         )
 
         vod = {
             "vod_id": url,
             "vod_name": title,
             "vod_pic": pic,
-            "vod_actor": creator,
-            "vod_director": creator,
+            "vod_actor": "",
+            "vod_director": "",
             "vod_content": content,
-            "vod_play_from": "$$$".join(sources),
-            "vod_play_url": "$$$".join(playlists)
+            "vod_play_from": "连续播放",
+            "vod_play_url": episodes,
+            "style": dict(LANDSCAPE_STYLE)
         }
 
-        return {"list": [vod]}
+        return {
+            "list": [vod]
+        }
+
+    # --------------------------------------------------------
+    # 播放解析
+    # --------------------------------------------------------
 
     def playerContent(self, flag, id, vipFlags):
         url = canonical(id)
 
-        try:
-            page = fetch(url, timeout=10)
-            choices = extract_streams(page)
-        except Exception:
-            choices = []
+        if not valid_video(url):
+            return {
+                "parse": 1,
+                "url": url
+            }
+
+        source = self._fetch(
+            url,
+            timeout=12
+        )
+
+        choices = extract_streams(source)
 
         if not choices:
             return {
@@ -557,15 +905,11 @@ class Spider(BaseSpider):
                 "url": url
             }
 
-        # 1080p 优先，列表不可访问时依次尝试其他清晰度。
         selected = choices[0]
 
-        for candidate in choices[:3]:
-            if ".mp4" in candidate.lower():
-                selected = candidate
-                break
-
-            if probe_playlist(candidate):
+        # 优先测试 1080P，失败后尝试其他清晰度。
+        for candidate in choices[:4]:
+            if probe_stream(candidate):
                 selected = candidate
                 break
 
