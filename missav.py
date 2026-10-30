@@ -690,6 +690,48 @@ def version_info(url):
     return code, label
 
 
+def parse_version_switch_links(source, current_url):
+    """Read actual version-switch menu links, never synthesize variant URLs."""
+    class SwitchParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.anchor = None
+            self.links = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == 'a':
+                data = dict(attrs)
+                self.anchor = {'href': data.get('href', ''),
+                               'role': data.get('role', ''), 'text': []}
+
+        def handle_data(self, data):
+            if self.anchor is not None:
+                self.anchor['text'].append(data)
+
+        def handle_endtag(self, tag):
+            if tag == 'a' and self.anchor is not None:
+                item = self.anchor
+                self.anchor = None
+                label = re.sub(r'\s+', '', ''.join(item['text']))
+                if ('切换' in label and any(word in label for word in
+                        ('无码', '有码', '字幕', '普通', '版本'))) or (
+                        item['role'] == 'menuitem' and '切换' in label):
+                    self.links.append(item['href'])
+
+    parser = SwitchParser()
+    parser.feed(source)
+    current = absolute(current_url).split('#', 1)[0]
+    code, _ = version_info(current)
+    found = []
+    for href in parser.links:
+        url = absolute(href).split('#', 1)[0]
+        other_code, _ = version_info(url)
+        if (url != current and valid_video(url) and url not in found
+                and (not code or other_code == code)):
+            found.append(url)
+    return found
+
+
 def candidate_versions(url):
     """Probe same-code variants only; never manufacture them in the UI."""
     parsed = urlparse(url)
@@ -1131,12 +1173,12 @@ class Spider(BaseSpider):
             if date_match:
                 release_date = '{}-{:02d}-{:02d}'.format(
                     date_match.group(1), int(date_match.group(2)), int(date_match.group(3)))
-        # Discover real same-code variants via the verified /cn/search/<code> page.
-        # Do not guess /dmNN/ paths: they can differ between versions.
+        # Prefer the site's explicit version-switch links. Search is only a
+        # fallback when the current page does not expose any switch links.
         candidates = [vid]
-        # Variant discovery is optional; a valid current page must play even
-        # when search is unavailable or returns no results.
-        if code:
+        switch_links = parse_version_switch_links(source, vid)
+        candidates.extend(link for link in switch_links if link not in candidates)
+        if not switch_links and code:
             search_status, search_html, search_blocked = self._request(
                 '/cn/search/' + quote(code, safe=''))
             if search_status == 200 and not search_blocked:
