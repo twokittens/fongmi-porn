@@ -4,7 +4,7 @@ import re
 import json
 import html as html_lib
 from urllib.parse import urljoin, quote
-import requests
+from base.spider import Spider as BaseSpider
 
 SITE = 'https://huangguoai.com'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -32,15 +32,27 @@ def cover(url):
     url = fix(url) if url else ''
     return url.split('?', 1)[0] if url.startswith(('https://', 'http://')) else ''
 
-def fetch(url, referer=None):
+def fetch(spider, url, referer=None):
     headers = dict(HEADERS)
     if referer:
         headers['Referer'] = referer
     try:
-        r = requests.get(url, headers=headers, timeout=(12, 25))
-        r.raise_for_status()
-        r.encoding = r.apparent_encoding if r.encoding is None else r.encoding
-        return r.text
+        response = spider.net.req(url, {
+            'method': 'GET', 'timeout': 25000,
+            'headers': headers, 'cookie': True
+        })
+        if isinstance(response, str):
+            response = json.loads(response)
+        if not isinstance(response, dict):
+            raise TypeError('net.req returned ' + type(response).__name__)
+        status = int(response.get('code', response.get('status', 0)) or 0)
+        if status != 200:
+            print('[Huangguo] HTTP', status, url)
+            return ''
+        content = response.get('content', '') or ''
+        if isinstance(content, bytes):
+            return content.decode('utf-8', errors='replace')
+        return str(content)
     except Exception as e:
         print('[Huangguo] request failed:', url, str(e))
         return ''
@@ -72,7 +84,7 @@ def parse_cards(page, all_grids=False):
             result.append({'vod_id': vid, 'vod_name': title, 'vod_pic': cover(pic), 'vod_remarks': ' · '.join(x for x in (ep, score) if x)})
     if not result:
         for m in re.finditer(r'<a\b[^>]*href=["\']([^"\']*/video/(\d+)/)[^"\']*["\'][^>]*>(.*?)</a>', page, re.I | re.S):
-            vid, title = m.group(2), clean(m.group(3)).removesuffix('全集在线观看').strip()
+            vid, title = m.group(2), re.sub(r'全集在线观看$', '', clean(m.group(3))).strip()
             if vid not in seen and title and not title.isdigit():
                 seen.add(vid)
                 result.append({'vod_id': vid, 'vod_name': title, 'vod_pic': '', 'vod_remarks': ''})
@@ -132,15 +144,15 @@ def extract_play(page, ep):
     url = fix(url) if url else ''
     return url if url.startswith(('http://', 'https://')) else ''
 
-class Spider:
+class Spider(BaseSpider):
     def __init__(self):
-        self.extend = None
+        self.hg_extend = None
 
     def getName(self):
         return '黄果短剧'
 
     def init(self, extend=''):
-        self.extend = extend
+        self.hg_extend = extend
 
     def isVideoFormat(self, url):
         return bool(re.search(r'\.(?:m3u8|mp4)(?:\?|$)', str(url), re.I))
@@ -155,7 +167,7 @@ class Spider:
         return {'class': CLASSES}
 
     def homeVideoContent(self):
-        return {'list': parse_cards(fetch(SITE + '/'), True)}
+        return {'list': parse_cards(fetch(self, SITE + '/'), True)}
 
     def categoryContent(self, tid, pg, filter=False, extend=None):
         try:
@@ -163,17 +175,17 @@ class Spider:
         except (ValueError, TypeError):
             page = 1
         if tid == 'ranks/hot':
-            return {'list': parse_ranks(fetch(SITE + '/ranks/hot/')), 'page': 1, 'pagecount': 1, 'limit': 20, 'total': 20}
+            return {'list': parse_ranks(fetch(self, SITE + '/ranks/hot/')), 'page': 1, 'pagecount': 1, 'limit': 20, 'total': 20}
         path = str(tid or '').strip('/')
         url = SITE + '/' + path + '/' + (str(page) + '/' if page > 1 else '')
-        items = parse_cards(fetch(url))
+        items = parse_cards(fetch(self, url))
         return {'list': items, 'page': page, 'pagecount': page + 1 if items else page, 'limit': len(items) or 20, 'total': (page + 1) * len(items) if items else page * 20}
 
     def detailContent(self, ids):
         vid = str(ids[0] if isinstance(ids, (list, tuple)) and ids else ids or '').strip()
         if not re.fullmatch(r'\d+', vid):
             return {'list': []}
-        page = fetch(SITE + '/video/' + vid + '/')
+        page = fetch(self, SITE + '/video/' + vid + '/')
         if not page:
             return {'list': []}
         data = initial_data(page)
@@ -192,7 +204,7 @@ class Spider:
         if not str(key or '').strip():
             return {'list': [], 'page': page, 'pagecount': page}
         url = SITE + '/search/video/' + quote(str(key).strip(), safe='') + '/' + (str(page) + '/' if page > 1 else '')
-        items = parse_cards(fetch(url))
+        items = parse_cards(fetch(self, url))
         return {'list': items, 'page': page, 'pagecount': page + 1 if items else page, 'limit': len(items) or 20, 'total': (page + 1) * len(items) if items else page * 20}
 
     def playerContent(self, flag, id, vipFlags=None):
@@ -201,7 +213,7 @@ class Spider:
         if not page_url.startswith(SITE + '/'):
             return {'parse': 0, 'url': ''}
         ep = parts[1] if len(parts) > 1 else '1'
-        url = extract_play(fetch(page_url, SITE + '/'), ep)
+        url = extract_play(fetch(self, page_url, SITE + '/'), ep)
         return {'parse': 0, 'url': url, 'header': {'User-Agent': UA, 'Referer': SITE + '/'}}
 
     def localProxy(self, param):
