@@ -1,13 +1,6 @@
-// huangguo_fongmi.js
-// FongMi / 影视TV QuickJS Spider adapter
-// Adapted from Yswag/xptv-extensions huangguo.js
-import 'assets://js/lib/crypto-js.js';
 
 const SITE = 'https://huangguoai.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const IMG_KEY = 'f5d965df75336270';
-const IMG_IV = '97b60394abc2fbe1';
-const EMPTY_IMAGE = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lXcAAAAASUVORK5CYII=';
 
 const HEADERS = {
   'User-Agent': UA,
@@ -17,11 +10,11 @@ const HEADERS = {
 };
 
 const CLASSES = [
-  { type_id: 'ai-duanju',  type_name: 'AI成人短剧' },
-  { type_id: 'ai-manju',   type_name: 'AI成人漫剧' },
+  { type_id: 'ai-duanju', type_name: 'AI成人短剧' },
+  { type_id: 'ai-manju', type_name: 'AI成人漫剧' },
   { type_id: 'ai-huanlian', type_name: 'AI换脸' },
-  { type_id: 'ai-mogai',   type_name: 'AI魔改' },
-  { type_id: 'ranks/hot',  type_name: '排行榜' }
+  { type_id: 'ai-mogai', type_name: 'AI魔改' },
+  { type_id: 'ranks/hot', type_name: '排行榜' }
 ];
 
 function fix(u) {
@@ -34,38 +27,7 @@ function fix(u) {
 
 function coverUrl(u) {
   u = fix(u).replace(/\?.*$/, '');
-  if (!/^https?:\/\//i.test(u)) return '';
-  return getProxy(true) + '&siteKey=huangguo_fongmi&url=' + encodeURIComponent(u);
-}
-
-function imageType(b64) {
-  if (b64.indexOf('/9j/') === 0) return 'image/jpeg';
-  if (b64.indexOf('iVBOR') === 0) return 'image/png';
-  if (b64.indexOf('UklGR') === 0) return 'image/webp';
-  if (b64.indexOf('R0lGOD') === 0) return 'image/gif';
-  return '';
-}
-
-function decryptCover(b64) {
-  if (imageType(b64)) return b64;
-  const ciphertext = CryptoJS.enc.Base64.parse(b64);
-  if (!ciphertext.sigBytes || ciphertext.sigBytes % 16) return '';
-  const plaintext = CryptoJS.AES.decrypt(
-    { ciphertext: ciphertext }, CryptoJS.enc.Utf8.parse(IMG_KEY),
-    { iv: CryptoJS.enc.Utf8.parse(IMG_IV), mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.NoPadding }
-  );
-  let hex = CryptoJS.enc.Hex.stringify(plaintext).toLowerCase();
-  if (!/^(ffd8|89504e470d0a1a0a|52494646|47494638)/.test(hex)) return '';
-  const pad = parseInt(hex.slice(-2), 16);
-  if (pad > 0 && pad <= 16 && hex.slice(-2 * pad) === pad.toString(16).padStart(2, '0').repeat(pad)) {
-    hex = hex.slice(0, -2 * pad);
-  }
-  let end = hex.lastIndexOf('ffd9');
-  if (hex.indexOf('ffd8') === 0 && end >= 0) hex = hex.slice(0, end + 4);
-  end = hex.lastIndexOf('49454e44ae426082');
-  if (hex.indexOf('89504e47') === 0 && end >= 0) hex = hex.slice(0, end + 16);
-  const out = CryptoJS.enc.Base64.stringify(CryptoJS.enc.Hex.parse(hex));
-  return imageType(out) ? out : '';
+  return /^https?:\/\//i.test(u) ? u : '';
 }
 
 function stripTags(s) {
@@ -83,7 +45,11 @@ function stripTags(s) {
 function getHtml(url, referer) {
   const headers = Object.assign({}, HEADERS);
   if (referer) headers.Referer = referer;
-  const r = req(url, { method: 'get', headers: headers, timeout: 15000 });
+  const r = req(url, {
+    method: 'get',
+    headers: headers,
+    timeout: 15000
+  });
   if (!r) return '';
   return typeof r.content === 'string' ? r.content : '';
 }
@@ -92,7 +58,9 @@ function gridSlices(html, allGrids) {
   const re = /<div\s+class="[^"]*\bhg-card-grid\b[^"]*"[^>]*>/g;
   const starts = [];
   let m;
-  while ((m = re.exec(html)) !== null) starts.push(m.index + m[0].length);
+  while ((m = re.exec(html)) !== null) {
+    starts.push(m.index + m[0].length);
+  }
   if (!starts.length) return [html];
   const slices = [];
   const n = allGrids ? starts.length : 1;
@@ -107,7 +75,9 @@ function cardBlocks(slice) {
   const re = /<div\s+class="[^"]*\bhg-drama-card\b[^"]*"[^>]*>/g;
   const starts = [];
   let m;
-  while ((m = re.exec(slice)) !== null) starts.push(m.index + m[0].length);
+  while ((m = re.exec(slice)) !== null) {
+    starts.push(m.index + m[0].length);
+  }
   const blocks = [];
   for (let i = 0; i < starts.length; i++) {
     const to = i + 1 < starts.length ? starts[i + 1] : slice.length;
@@ -117,12 +87,12 @@ function cardBlocks(slice) {
 }
 
 function parseCardBlock(block) {
-  // New site uses /video/ID/ ; old source used /detail/ID/
   const a = block.match(/href="[^"]*\/(?:detail|video)\/(\d+)\/[^"]*"/);
   if (!a) return null;
   const vid = a[1];
 
-  const imgM = block.match(/data-src="([^"]+)"/) || block.match(/src="([^"]+)"/);
+  const imgM = block.match(/data-src="([^"]+)"/) ||
+               block.match(/src="([^"]+)"/);
   let title = '';
 
   const t = block.match(/hg-drama-card__title[^>]*>([\s\S]*?)<\/a>/);
@@ -165,7 +135,6 @@ function parseGridCards(html, allGrids) {
     }
   }
 
-  // Fallback for site layout changes: parse links around /video/ID/
   if (!list.length) {
     const re = /<a\b[^>]*href="([^"]*\/video\/(\d+)\/)[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
     let m;
@@ -176,10 +145,14 @@ function parseGridCards(html, allGrids) {
       name = name.replace(/全集在线观看\s*$/g, '').trim();
       if (!name || /^\d+$/.test(name)) continue;
       seen[id] = true;
-      list.push({ vod_id: id, vod_name: name, vod_pic: '', vod_remarks: '' });
+      list.push({
+        vod_id: id,
+        vod_name: name,
+        vod_pic: '',
+        vod_remarks: ''
+      });
     }
   }
-
   return list;
 }
 
@@ -193,7 +166,10 @@ function parseRanks(html) {
   const re = /<div\s+class="[^"]*\bhg-rank-item\b[^"]*"[^>]*>/g;
   const starts = [];
   let m;
-  while ((m = re.exec(slice)) !== null) starts.push(m.index + m[0].length);
+
+  while ((m = re.exec(slice)) !== null) {
+    starts.push(m.index + m[0].length);
+  }
 
   for (let i = 0; i < starts.length; i++) {
     const to = i + 1 < starts.length ? starts[i + 1] : slice.length;
@@ -202,10 +178,12 @@ function parseRanks(html) {
     if (!a || seen[a[1]]) continue;
 
     const id = a[1];
-    const imgM = block.match(/data-src="([^"]+)"/) || block.match(/src="([^"]+)"/);
+    const imgM = block.match(/data-src="([^"]+)"/) ||
+                 block.match(/src="([^"]+)"/);
     let title = '';
     const t = block.match(/hg-rank-item__title[^>]*>([\s\S]*?)<\/h2>/);
     if (t) title = stripTags(t[1]);
+
     if (!title) {
       const tt = block.match(/<a[^>]+href="[^"]*\/(?:detail|video)\/\d+\/[^"]*"[^>]*>([\s\S]*?)<\/a>/);
       if (tt) title = stripTags(tt[1]);
@@ -221,15 +199,17 @@ function parseRanks(html) {
       vod_remarks: tags ? stripTags(tags[1]) : ''
     });
   }
-
   return list;
 }
 
 function parseTitle(html, fallback) {
   const h1 = html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i);
   if (h1) return stripTags(h1[1]);
+
   const title = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
-  if (title) return stripTags(title[1]).replace(/\s*[-|｜].*$/, '').trim();
+  if (title) {
+    return stripTags(title[1]).replace(/\s*[-|｜].*$/, '').trim();
+  }
   return fallback || '';
 }
 
@@ -241,9 +221,11 @@ function parsePic(html) {
       if (pic) return coverUrl(pic);
     } catch (e) {}
   }
+
   const og = html.match(/<meta\b[^>]*(?:property|name)="og:image"[^>]*content="([^"]+)"[^>]*>/i) ||
              html.match(/<meta\b[^>]*content="([^"]+)"[^>]*(?:property|name)="og:image"[^>]*>/i);
   if (og) return coverUrl(og[1]);
+
   const pic = html.match(/<img\b[^>]*(?:class="[^"]*hg-web-detail[^\"]*"[^>]*)?(?:data-src|src)="([^"]+)"/i);
   return coverUrl(pic ? pic[1] : '');
 }
@@ -252,36 +234,40 @@ function parseEpisodes(html, id) {
   const eps = [];
   const seen = {};
 
-  // First try the dedicated episode grid used by the original site source.
   const gridM = html.match(/<div\s+class="[^"]*\bhg-web-detail__ep-grid\b[^"]*"[^>]*>([\s\S]*?)<\/div>/);
   const scope = gridM ? gridM[1] : html;
   const are = /<a\b[^>]*>[\s\S]*?<\/a>/g;
   let m;
+
   while ((m = are.exec(scope)) !== null) {
     const tag = m[0];
     const hrefM = tag.match(/href="([^"]+)"/);
     if (!hrefM) continue;
+
     const href = fix(hrefM[1]);
-    if (href.indexOf('/video/' + id + '/') === -1 && href.indexOf('/detail/' + id + '/') === -1) continue;
+    if (href.indexOf('/video/' + id + '/') === -1 &&
+        href.indexOf('/detail/' + id + '/') === -1) continue;
 
     let ep = '';
     const eidM = tag.match(/data-ep-id="([^"]*)"/);
     if (eidM && eidM[1]) ep = eidM[1];
+
     if (!ep) {
       const p = href.match(/\/ep-(\d+)\/?/);
       if (p) ep = p[1];
     }
+
     if (!ep) {
       const tx = stripTags(tag).match(/(\d+)/);
       if (tx) ep = String(parseInt(tx[1], 10));
     }
+
     if (!ep) ep = '1';
     if (seen[ep]) continue;
     seen[ep] = true;
     eps.push({ ep: ep, url: href });
   }
 
-  // If the grid selector changed, search the full page for /video/ID/ep-N/ links.
   const vre = new RegExp('href="([^"]*/video/' + id + '/(?:ep-(\\d+)/)?)"', 'g');
   while ((m = vre.exec(html)) !== null) {
     const ep = m[2] || '1';
@@ -290,8 +276,13 @@ function parseEpisodes(html, id) {
     eps.push({ ep: ep, url: fix(m[1]) });
   }
 
-  if (!eps.length) eps.push({ ep: '1', url: SITE + '/video/' + id + '/' });
-  eps.sort(function (a, b) { return parseInt(a.ep, 10) - parseInt(b.ep, 10); });
+  if (!eps.length) {
+    eps.push({ ep: '1', url: SITE + '/video/' + id + '/' });
+  }
+
+  eps.sort(function(a, b) {
+    return parseInt(a.ep, 10) - parseInt(b.ep, 10);
+  });
   return eps;
 }
 
@@ -302,6 +293,7 @@ function normalizePlayUrl(u) {
     .replace(/\\\//g, '/')
     .replace(/&amp;/g, '&')
     .trim();
+
   if (u.indexOf('//') === 0) u = 'https:' + u;
   if (u.indexOf('/') === 0) u = SITE + u;
   return u;
@@ -310,11 +302,13 @@ function normalizePlayUrl(u) {
 function extractPlay(html, ep) {
   let play = '';
   const m = html.match(/id=["']videoInitialData["'][^>]*>([\s\S]*?)<\/script>/i);
+
   if (m) {
     try {
       const data = JSON.parse(m[1]);
       const srcs = data && data.epPlaySrcs ? data.epPlaySrcs : {};
-      play = srcs[String(ep || '1')] || (data && data.videoSrc) || '';
+      play = srcs[String(ep || '1')] ||
+             (data && data.videoSrc) || '';
     } catch (e) {}
   }
 
@@ -340,7 +334,9 @@ export default {
   homeVod() {
     try {
       const html = getHtml(SITE + '/');
-      return JSON.stringify({ list: parseGridCards(html, true) });
+      return JSON.stringify({
+        list: parseGridCards(html, true)
+      });
     } catch (e) {
       return JSON.stringify({ list: [] });
     }
@@ -356,9 +352,13 @@ export default {
         const id = String(tid || '').replace(/^\/+|\/+$/g, '');
         url = SITE + '/' + id + '/' + (page > 1 ? page + '/' : '');
       }
+
       const html = getHtml(url);
       const isRank = String(tid || '').indexOf('rank') !== -1;
-      const list = isRank ? parseRanks(html).slice(0, 20) : parseGridCards(html, false);
+      const list = isRank
+        ? parseRanks(html).slice(0, 20)
+        : parseGridCards(html, false);
+
       if (isRank) {
         return JSON.stringify({
           list: list,
@@ -368,32 +368,40 @@ export default {
           total: 20
         });
       }
-      
+
       return JSON.stringify({
         list: list,
         page: page,
         pagecount: list.length ? page + 1 : page,
         limit: list.length || 20,
-        total: list.length ? (page + 1) * list.length : page * 20
+        total: list.length
+          ? (page + 1) * list.length
+          : page * 20
       });
     } catch (e) {
-      return JSON.stringify({ list: [], page: page, pagecount: page });
+      return JSON.stringify({
+        list: [],
+        page: page,
+        pagecount: page
+      });
     }
   },
 
   detail(id) {
     id = String(id || '').trim();
     if (!id) return JSON.stringify({ list: [] });
+
     try {
       const url = SITE + '/video/' + id + '/';
       const html = getHtml(url, SITE + '/');
       const eps = parseEpisodes(html, id);
       const playList = [];
+
       for (let i = 0; i < eps.length; i++) {
         const ep = eps[i];
-        const name = '第' + ep.ep + '集';
-        // Pass exact episode page URL + episode number to play().
-        playList.push(name + '$' + ep.url + '|||' + ep.ep);
+        playList.push(
+          '第' + ep.ep + '集$' + ep.url + '|||' + ep.ep
+        );
       }
 
       const vod = {
@@ -403,6 +411,7 @@ export default {
         vod_play_from: '黄果',
         vod_play_url: playList.join('#')
       };
+
       return JSON.stringify({ list: [vod] });
     } catch (e) {
       return JSON.stringify({ list: [] });
@@ -412,21 +421,38 @@ export default {
   search(wd, quick, pg) {
     const key = String(wd || '').trim();
     const page = Math.max(1, parseInt(pg || '1', 10) || 1);
-    if (!key) return JSON.stringify({ list: [], page: page, pagecount: page });
+
+    if (!key) {
+      return JSON.stringify({
+        list: [],
+        page: page,
+        pagecount: page
+      });
+    }
+
     try {
-      let url = SITE + '/search/video/' + encodeURIComponent(key) + '/';
+      let url = SITE + '/search/video/' +
+                encodeURIComponent(key) + '/';
       if (page > 1) url += page + '/';
+
       const html = getHtml(url, SITE + '/');
       const list = parseGridCards(html, false);
+
       return JSON.stringify({
         list: list,
         page: page,
         pagecount: list.length ? page + 1 : page,
         limit: list.length || 20,
-        total: list.length ? (page + 1) * (list.length || 20) : page * 20
+        total: list.length
+          ? (page + 1) * list.length
+          : page * 20
       });
     } catch (e) {
-      return JSON.stringify({ list: [], page: page, pagecount: page });
+      return JSON.stringify({
+        list: [],
+        page: page,
+        pagecount: page
+      });
     }
   },
 
@@ -436,11 +462,17 @@ export default {
       const parts = raw.split('|||');
       const pageUrl = fix(parts[0]);
       const ep = parts.length > 1 ? parts[1] : '1';
-      if (!pageUrl) return JSON.stringify({ parse: 0, url: '' });
+
+      if (!pageUrl) {
+        return JSON.stringify({ parse: 0, url: '' });
+      }
 
       const html = getHtml(pageUrl, SITE + '/');
       const play = extractPlay(html, ep);
-      if (!play) return JSON.stringify({ parse: 0, url: '' });
+
+      if (!play) {
+        return JSON.stringify({ parse: 0, url: '' });
+      }
 
       return JSON.stringify({
         parse: 0,
@@ -452,20 +484,6 @@ export default {
       });
     } catch (e) {
       return JSON.stringify({ parse: 0, url: '' });
-    }
-  },
-
-  proxy(params) {
-    try {
-      const url = String(params && params.url || '');
-      if (!/^https?:\/\//i.test(url)) return [200, 'image/png', EMPTY_IMAGE, {}, 1];
-      const r = req(url, { method: 'get', headers: HEADERS, buffer: 2, timeout: 7000 });
-      if (!r || Number(r.code) !== 200 || !r.content) return [200, 'image/png', EMPTY_IMAGE, {}, 1];
-      const image = decryptCover(String(r.content));
-      if (!image) return [200, 'image/png', EMPTY_IMAGE, {}, 1];
-      return [200, imageType(image), image, { 'Cache-Control': 'public, max-age=3600' }, 1];
-    } catch (e) {
-      return [200, 'image/png', EMPTY_IMAGE, {}, 1];
     }
   }
 };
