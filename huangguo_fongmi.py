@@ -394,7 +394,7 @@ class Spider(BaseSpider):
             return {'list': self._proxy_pics(items), 'page': 1,
                     'pagecount': 1, 'limit': 20, 'total': len(items)}
 
-        # Tag archives use /tag/<slug>/<N>/ pagination.
+        # Tag archives use /tag/<slug>/page/<N>/ pagination.
         if str(tid).startswith('tag/'):
             slug = str(tid).split('/', 1)[1].strip('/')
             if not re.fullmatch(r'[A-Za-z0-9_-]+', slug):
@@ -402,7 +402,10 @@ class Spider(BaseSpider):
             url = tag_page_url(slug, page)
             html = fetch(self, url)
             items = parse_cards(html)
-            pages = page_count(html, page if not items else page + (1 if len(items) >= 20 else 0))
+            # Some tag archives contain fewer than 20 cards per page while
+            # still having more pages. Continue until an empty page is reached
+            # when the archive does not expose a usable page count.
+            pages = page_count(html, page if not items else page + 1)
             return {'list': self._proxy_pics(items), 'page': page,
                     'pagecount': max(page, pages), 'limit': 20,
                     'total': max(page, pages) * 20}
