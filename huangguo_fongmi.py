@@ -34,7 +34,20 @@ def fix(url):
 
 def cover(url):
     url = fix(url) if url else ''
-    return url.split('?', 1)[0] if url.startswith(('https://', 'http://')) else ''
+    return url if url.startswith(('https://', 'http://')) else ''
+
+def image_from_card(fragment):
+    """Read actual lazy-loaded image, not the placeholder in img.src."""
+    tag = match(r'<img\b([^>]+)>', fragment)
+    if not tag:
+        return ''
+    for attribute in ('data-src', 'data-original', 'data-lazy-src', 'src'):
+        m = re.search(r'(?<![\w-])' + re.escape(attribute) + r"\s*=\s*([\"'])(.*?)\1", tag, re.I | re.S)
+        if m:
+            url = html_lib.unescape(m.group(2)).strip()
+            if url and not url.startswith(('data:', 'blob:')) and 'cover-placeholder' not in url:
+                return cover(url)
+    return ''
 
 def decrypt_image(raw):
     """Decrypt Huangguo AES-CBC cover; return (MIME, base64 image)."""
@@ -141,7 +154,7 @@ def parse_cards(page, all_grids=False):
                 title = clean(match(r'<a\b[^>]*href=["\'][^"\']*/(?:detail|video)/\d+/[^>]*>(.*?)</a>', b))
             if not title:
                 continue
-            pic = match(r'(?:data-src|src)=["\']([^"\']+)', b)
+            pic = image_from_card(b)
             ep = clean(match(r'hg-drama-card__episode[^>]*>(.*?)</span>', b))
             score = clean(match(r'hg-drama-card__score[^>]*>(.*?)</span>', b))
             seen.add(vid)
@@ -167,7 +180,7 @@ def parse_ranks(page):
         if not title:
             continue
         seen.add(vid)
-        result.append({'vod_id': vid, 'vod_name': title, 'vod_pic': cover(match(r'(?:data-src|src)=["\']([^"\']+)', b)), 'vod_remarks': clean(match(r'hg-rank-item__tags[^>]*>(.*?)</div>', b))})
+        result.append({'vod_id': vid, 'vod_name': title, 'vod_pic': image_from_card(b), 'vod_remarks': clean(match(r'hg-rank-item__tags[^>]*>(.*?)</div>', b))})
         if len(result) >= 20:
             break
     return result
