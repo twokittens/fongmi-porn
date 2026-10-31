@@ -154,7 +154,7 @@ def page_count(page, default=1):
         path = html_lib.unescape(href).split('?', 1)[0].rstrip('/')
         # Ignore video/detail IDs and unrelated numeric URLs; only accept
         # pagination-shaped links. The category site uses /category/2/.
-        if re.search(r'/(?:video|detail|tag|search)(?:/|$)', path, re.I):
+        if re.search(r'/(?:video|detail|search)(?:/|$)', path, re.I):
             continue
         m = re.search(r'/page/(\d+)$', path, re.I) or re.search(r'/(\d+)$', path)
         if m:
@@ -177,8 +177,10 @@ def category_page_url(path, page):
 
 
 def tag_page_url(slug, page):
+    # Tag archives use the same numeric suffix pagination as the original
+    # site route: /tag/<slug>/2/, /tag/<slug>/3/, etc.
     base = SITE + '/tag/' + slug.strip('/') + '/'
-    return base if page <= 1 else base + 'page/' + str(page) + '/'
+    return base if page <= 1 else base + str(page) + '/'
 
 
 def parse_cards(page, all_grids=False):
@@ -384,7 +386,7 @@ class Spider(BaseSpider):
             return {'list': self._proxy_pics(items), 'page': 1,
                     'pagecount': 1, 'limit': 20, 'total': len(items)}
 
-        # Tag pages use the site's confirmed /tag/<slug>/page/<N>/ route.
+        # Tag archives use /tag/<slug>/<N>/ pagination.
         if str(tid).startswith('tag/'):
             slug = str(tid).split('/', 1)[1].strip('/')
             if not re.fullmatch(r'[A-Za-z0-9_-]+', slug):
