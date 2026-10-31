@@ -14,6 +14,7 @@ SITE = 'https://huangguoai.com'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 HEADERS = {'User-Agent': UA, 'Referer': SITE + '/', 'Accept-Language': 'zh-CN,zh;q=0.9'}
 CLASSES = [
+    {'type_id': 'hg-diagnostics', 'type_name': '封面诊断'},
     {'type_id': 'ai-duanju', 'type_name': 'AI成人短剧'},
     {'type_id': 'ai-manju', 'type_name': 'AI成人漫剧'},
     {'type_id': 'ai-huanlian', 'type_name': 'AI换脸'},
@@ -258,12 +259,17 @@ class Spider(BaseSpider):
             return ''
         try:
             proxy = self.getProxyUrl()
-            if proxy:
-                separator = '&' if '?' in proxy else '?'
-                return proxy + separator + 'url=' + quote(url, safe='')
-        except Exception:
-            pass
-        return url
+            print('[HG-COVER] PROXY:', repr(proxy))
+            if not proxy:
+                print('[HG-COVER] ERROR: proxy URL is empty')
+                return ''
+            separator = '&' if '?' in proxy else '?'
+            result = proxy + separator + 'url=' + quote(url, safe='')
+            print('[HG-COVER] RESULT:', result[:400])
+            return result
+        except Exception as e:
+            print('[HG-COVER] PROXY ERROR:', repr(e))
+            return ''
 
     def _proxy_pics(self, items):
         for item in items:
@@ -274,11 +280,74 @@ class Spider(BaseSpider):
     def homeVideoContent(self):
         return {'list': self._proxy_pics(parse_cards(fetch(self, SITE + '/'), True))}
 
+    def _diagnostic_cards(self):
+        cards = []
+        def add(title, detail):
+            cards.append({'vod_id': 'diagnostic', 'vod_name': title,
+                          'vod_pic': '', 'vod_remarks': str(detail)[:180]})
+        try:
+            method = getattr(self, 'getProxyUrl', None)
+            if not callable(method):
+                add('❌ 代理接口不存在', 'getProxyUrl 不存在，封面 URL 无法生成')
+            else:
+                try:
+                    proxy = method()
+                    add('代理地址：' + ('成功' if proxy else '为空'), str(proxy)[:160])
+                except Exception as e:
+                    add('❌ 代理接口报错', repr(e))
+        except Exception as e:
+            add('❌ 代理检查失败', repr(e))
+        try:
+            from Crypto.Cipher import AES
+            add('✅ AES 库可用', 'Crypto.Cipher')
+        except Exception:
+            try:
+                from Cryptodome.Cipher import AES
+                add('✅ AES 库可用', 'Cryptodome.Cipher')
+            except Exception:
+                try:
+                    from cryptography.hazmat.primitives.ciphers import Cipher
+                    add('✅ AES 库可用', 'cryptography')
+                except Exception:
+                    add('❌ AES 库不可用', '未找到 Crypto、Cryptodome 或 cryptography')
+        try:
+            html = fetch(self, SITE + '/ai-duanju/')
+            pic = next((i.get('vod_pic') for i in parse_cards(html) if i.get('vod_pic')), '')
+            if not pic:
+                add('❌ 页面未提取到封面', 'HTML 长度=' + str(len(html)))
+            else:
+                add('✅ 封面地址已提取', pic[:160])
+                try:
+                    r = self.net.req(pic, {'method': 'GET', 'timeout': 20000,
+                                           'headers': dict(HEADERS), 'buffer': 2})
+                    if isinstance(r, str): r = json.loads(r)
+                    if not isinstance(r, dict):
+                        add('❌ 图片请求返回异常', type(r).__name__)
+                    else:
+                        status = r.get('code', r.get('status', '未知'))
+                        raw = r.get('content', '')
+                        add('图片请求 HTTP ' + str(status), '返回类型=' + type(raw).__name__ + ' 长度=' + str(len(raw) if hasattr(raw, '__len__') else '?'))
+                        if str(status) == '200':
+                            try:
+                                result = decrypt_image(raw)
+                                add('✅ 图片解密成功' if result else '❌ 图片解密失败',
+                                    ('格式=' + result[0]) if result else '检查 AES 库、buffer 格式及密文')
+                            except Exception as e:
+                                add('❌ 图片解密异常', repr(e))
+                except Exception as e:
+                    add('❌ 图片下载异常', repr(e))
+        except Exception as e:
+            add('❌ 页面检查异常', repr(e))
+        return cards
+
     def categoryContent(self, tid, pg, filter=False, extend=None):
         try:
             page = max(1, int(pg or 1))
         except (ValueError, TypeError):
             page = 1
+        if tid == 'hg-diagnostics':
+            cards = self._diagnostic_cards()
+            return {'list': cards, 'page': 1, 'pagecount': 1, 'limit': len(cards), 'total': len(cards)}
         if tid == 'ranks/hot':
             return {'list': self._proxy_pics(parse_ranks(fetch(self, SITE + '/ranks/hot/'))), 'page': 1, 'pagecount': 1, 'limit': 20, 'total': 20}
         path = str(tid or '').strip('/')
@@ -288,6 +357,8 @@ class Spider(BaseSpider):
 
     def detailContent(self, ids):
         vid = str(ids[0] if isinstance(ids, (list, tuple)) and ids else ids or '').strip()
+        if vid == 'diagnostic':
+            return {'list': [{'vod_id': vid, 'vod_name': '封面诊断', 'vod_content': '\n'.join(x['vod_name'] + ': ' + x['vod_remarks'] for x in self._diagnostic_cards()), 'vod_play_from': '诊断', 'vod_play_url': ''}]}
         if not re.fullmatch(r'\d+', vid):
             return {'list': []}
         page = fetch(self, SITE + '/video/' + vid + '/')
@@ -326,12 +397,14 @@ class Spider(BaseSpider):
             url = str((param or {}).get('url') or '')
             if not url.startswith(('https://', 'http://')):
                 return [404, 'text/plain', 'Invalid image URL']
+            print('[HG-COVER] LOCAL PROXY REQUEST:', url.split('?', 1)[0])
             response = self.net.req(url, {
                 'method': 'GET', 'timeout': 15000,
                 'headers': dict(HEADERS), 'buffer': 2
             })
             if isinstance(response, str):
                 response = json.loads(response)
+            print('[HG-COVER] FETCH RESPONSE:', type(response).__name__, 'code=', response.get('code') if isinstance(response, dict) else 'N/A')
             if not isinstance(response, dict) or int(response.get('code', 0)) != 200:
                 return [404, 'text/plain', 'Image fetch failed']
             result = decrypt_image(response.get('content', ''))
@@ -339,6 +412,7 @@ class Spider(BaseSpider):
                 print('[HG-COVER] decrypt failed for:', url.split('?', 1)[0])
                 return [404, 'text/plain', 'Image decrypt failed']
             mime, data = result
+            print('[HG-COVER] DECRYPT OK:', mime, 'base64_len=', len(data))
             return [200, mime, data, {'Cache-Control': 'public, max-age=3600'}, 1]
         except Exception as error:
             print('[Huangguo] image proxy error:', str(error))
