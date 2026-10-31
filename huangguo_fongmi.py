@@ -147,6 +147,37 @@ def blocks(text, marker):
     starts = [m.end() for m in re.finditer(r'<div\b[^>]*class=["\'][^"\']*\b' + re.escape(marker) + r'\b[^"\']*["\'][^>]*>', text, re.I)]
     return [text[starts[i]:(starts[i + 1] if i + 1 < len(starts) else len(text))] for i in range(len(starts))]
 
+def page_count(page, default=1):
+    """Read the last page number from the site's rendered pagination links."""
+    nums = [1]
+    for href in re.findall(r"href=[\"']([^\"']+)", page or '', re.I):
+        path = html_lib.unescape(href).split('?', 1)[0].rstrip('/')
+        m = re.search(r'/page/(\d+)$', path, re.I)
+        if not m:
+            m = re.search(r'/(\d+)$', path)
+        if m:
+            try:
+                nums.append(int(m.group(1)))
+            except ValueError:
+                pass
+    # Also support explicit total-page metadata when present.
+    for pat in (r'data-total-pages=["\'](\d+)', r'"total_pages"\s*:\s*(\d+)',
+                r'"pagecount"\s*:\s*(\d+)'):
+        for value in re.findall(pat, page or '', re.I):
+            nums.append(int(value))
+    return max(nums) if len(nums) > 1 else default
+
+
+def category_page_url(path, page):
+    base = SITE + '/' + str(path).strip('/') + '/'
+    return base if page <= 1 else base + 'page/' + str(page) + '/'
+
+
+def tag_page_url(slug, page):
+    base = SITE + '/tag/' + slug.strip('/') + '/'
+    return base if page <= 1 else base + 'page/' + str(page) + '/'
+
+
 def parse_cards(page, all_grids=False):
     grids = blocks(page, 'hg-card-grid')
     scopes = grids if all_grids else grids[:1]
@@ -350,17 +381,18 @@ class Spider(BaseSpider):
             return {'list': self._proxy_pics(items), 'page': 1,
                     'pagecount': 1, 'limit': 20, 'total': len(items)}
 
-        # Tag categories use the website's real /tag/<slug>/ path.
+        # Tag pages use the site's confirmed /tag/<slug>/page/<N>/ route.
         if str(tid).startswith('tag/'):
             slug = str(tid).split('/', 1)[1].strip('/')
             if not re.fullmatch(r'[A-Za-z0-9_-]+', slug):
-                return {'list': [], 'page': page, 'pagecount': page}
-            url = SITE + '/tag/' + slug + '/' + (str(page) + '/' if page > 1 else '')
-            items = parse_cards(fetch(self, url))
+                return {'list': [], 'page': page, 'pagecount': page, 'total': 0}
+            url = tag_page_url(slug, page)
+            html = fetch(self, url)
+            items = parse_cards(html)
+            pages = page_count(html, page if not items else page + (1 if len(items) >= 20 else 0))
             return {'list': self._proxy_pics(items), 'page': page,
-                    'pagecount': page + 1 if items else page,
-                    'limit': len(items) or 20,
-                    'total': (page + 1) * len(items) if items else page * 20}
+                    'pagecount': max(page, pages), 'limit': 20,
+                    'total': max(page, pages) * 20}
 
         path = str(tid or '').strip('/')
         sort = ''
@@ -374,30 +406,71 @@ class Spider(BaseSpider):
             except Exception:
                 pass
 
-        # Always retain the site's normal category HTML as the primary source.
-        # This avoids returning an empty list when a speculative JSON API shape changes.
-        page_path = SITE + '/' + path + '/' + (str(page) + '/' if page > 1 else '')
+        # "最近更新" is the site's native default ordering: do not append
+        # any sort parameter and do not reorder the returned cards.
+        if sort in ('', 'latest'):
+            html = fetch(self, category_page_url(path, page))
+            items = parse_cards(html)
+            pages = page_count(html, page if not items else page + (1 if len(items) >= 20 else 0))
+            return {'list': self._proxy_pics(items), 'page': page,
+                    'pagecount': max(page, pages), 'limit': 20,
+                    'total': max(page, pages) * 20}
+
         if sort == 'hot_window':
-            # The site recognizes hot_window as a sort value; request it on the
-            # category page first, then gracefully fall back to the normal page.
-            hot_url = page_path + ('&' if '?' in page_path else '?') + 'sort=hot_window'
-            hot_html = fetch(self, hot_url)
-            items = parse_cards(hot_html) if hot_html else []
-            if not items:
-                api_items, _, _ = self._api_category(path, page, 'hot_window')
-                items = api_items
-            if not items:
-                items = parse_cards(fetch(self, page_path))
-        else:
-            items = parse_cards(fetch(self, page_path))
+            # Dedicated hot feed only. Never fall back to the default/latest
+            # category HTML: an unavailable hot endpoint must stay visibly empty.
+            api_items, pages, total = self._api_category(path, page, 'hot_window')
+            if not api_items:
+                print('[Huangguo] hot category API returned no items:', path, page)
+                return {'list': [], 'page': page, 'pagecount': max(page, pages),
+                        'limit': 21, 'total': total}
+            return {'list': self._proxy_pics(api_items), 'page': page,
+                    'pagecount': max(page, pages), 'limit': 21,
+                    'total': total or pages * 21}
 
         if sort == 'episode_count':
-            items.sort(key=lambda x: int(x.get('_episode_count') or 0), reverse=True)
+            # Fetch every category page first, then perform a global sort.
+            # Sorting only the currently requested page gives incorrect results.
+            all_items, seen = [], set()
+            first_html = fetch(self, category_page_url(path, 1))
+            if not first_html:
+                return {'list': [], 'page': page, 'pagecount': page, 'total': 0}
+            detected_pages = page_count(first_html, 0)
+            first_batch = parse_cards(first_html)
+            # If the site omits pagination metadata but returns a full page,
+            # continue sequentially until the first short/empty page.
+            last_page = detected_pages or (100 if len(first_batch) >= 20 else 1)
+            for p in range(1, min(last_page, 100) + 1):
+                html = first_html if p == 1 else fetch(self, category_page_url(path, p))
+                if not html:
+                    break
+                batch = parse_cards(html)
+                if not batch:
+                    break
+                for item in batch:
+                    vid = str(item.get('vod_id') or '')
+                    if vid and vid not in seen:
+                        seen.add(vid)
+                        all_items.append(item)
+                # Stop at the first short page; this also handles sites whose
+                # pagination metadata is missing or stale.
+                if len(batch) < 20:
+                    break
+            all_items.sort(key=lambda x: int(x.get('_episode_count') or 0), reverse=True)
+            total = len(all_items)
+            page_size = 20
+            pagecount = max(1, (total + page_size - 1) // page_size)
+            selected = all_items[(page - 1) * page_size:page * page_size]
+            return {'list': self._proxy_pics(selected), 'page': page,
+                    'pagecount': pagecount, 'limit': page_size, 'total': total}
 
+        # Unknown filter values must not silently alter the website's order.
+        html = fetch(self, category_page_url(path, page))
+        items = parse_cards(html)
+        pages = page_count(html, page if not items else page + (1 if len(items) >= 20 else 0))
         return {'list': self._proxy_pics(items), 'page': page,
-                'pagecount': page + 1 if items else page,
-                'limit': len(items) or 20,
-                'total': (page + 1) * len(items) if items else page * 20}
+                'pagecount': max(page, pages), 'limit': 20,
+                'total': max(page, pages) * 20}
 
     def detailContent(self, ids):
         vid = str(ids[0] if isinstance(ids, (list, tuple)) and ids else ids or '').strip()
@@ -433,8 +506,8 @@ class Spider(BaseSpider):
         vod = {'vod_id': vid, 'vod_name': title, 'vod_pic': self._cover_proxy(cover(pic)),
                'vod_play_from': '黄果', 'vod_play_url': '#'.join(playlist)}
         if tag_links:
-            vod['vod_actor'] = '、'.join(tag_links)
-            vod['vod_content'] = '相关标签：' + '、'.join(tag_names)
+            # FongMi renders links embedded in the description as clickable tags.
+            vod['vod_content'] = '相关标签：' + '、'.join(tag_links)
         return {'list': [vod]}
 
     def searchContent(self, key, quick=False, pg='1'):
