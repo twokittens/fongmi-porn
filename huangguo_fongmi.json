@@ -1,10 +1,10 @@
 {
   "sites": [
     {
-      "key": "huangguo_python",
+      "key": "huangguo_python1111",
       "name": "黄果短剧test1",
       "type": 3,
-      "api": "https://raw.githubusercontent.com/twokittens/fongmi-porn/main/test.py",
+      "api": "./test.py",
       "searchable": 1,
       "quickSearch": 0,
       "filterable": 0,
