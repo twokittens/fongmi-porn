@@ -2,7 +2,7 @@
   "sites": [
     {
       "key": "huangguo_python1111",
-      "name": "黄果短剧test1",
+      "name": "黄果短剧test11",
       "type": 3,
       "api": "./test.py",
       "searchable": 1,
