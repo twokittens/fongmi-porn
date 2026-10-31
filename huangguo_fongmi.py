@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Huangguo FongMi Python Spider, based on huangguo_fongmi.js."""
+"""Huangguo FongMi Python Spider: direct data URI cover experiment."""
 import re
 import json
 import base64
@@ -14,7 +14,7 @@ SITE = 'https://huangguoai.com'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 HEADERS = {'User-Agent': UA, 'Referer': SITE + '/', 'Accept-Language': 'zh-CN,zh;q=0.9'}
 CLASSES = [
-    {'type_id': 'hg-diagnostics', 'type_name': '封面诊断'},
+    {'type_id': 'hg-diagnostics', 'type_name': 'Base64封面测试'},
     {'type_id': 'ai-duanju', 'type_name': 'AI成人短剧'},
     {'type_id': 'ai-manju', 'type_name': 'AI成人漫剧'},
     {'type_id': 'ai-huanlian', 'type_name': 'AI换脸'},
@@ -255,26 +255,36 @@ class Spider(BaseSpider):
         return {'class': CLASSES}
 
     def _cover_proxy(self, url):
+        """Directly decrypt a remote image and return a data URI (no proxy)."""
         if not url:
             return ''
         try:
-            proxy = self.getProxyUrl()
-            print('[HG-COVER] PROXY:', repr(proxy))
-            if not proxy:
-                print('[HG-COVER] ERROR: proxy URL is empty')
+            response = self.net.req(url, {
+                'method': 'GET', 'timeout': 20000,
+                'headers': dict(HEADERS), 'buffer': 2
+            })
+            if isinstance(response, str):
+                response = json.loads(response)
+            if not isinstance(response, dict):
                 return ''
-            separator = '&' if '?' in proxy else '?'
-            result = proxy + separator + 'url=' + quote(url, safe='')
-            print('[HG-COVER] RESULT:', result[:400])
-            return result
-        except Exception as e:
-            print('[HG-COVER] PROXY ERROR:', repr(e))
+            status = response.get('code', response.get('status', 0))
+            if str(status) != '200':
+                return ''
+            result = decrypt_image(response.get('content', ''))
+            if not result:
+                return ''
+            mime, encoded = result
+            return 'data:' + mime + ';base64,' + encoded
+        except Exception as error:
+            print('[HG-COVER] data URI failure:', repr(error))
             return ''
 
     def _proxy_pics(self, items):
-        for item in items:
+        # Keep the experiment small: one cover per listing page.
+        # This avoids downloading dozens of images during every category request.
+        for index, item in enumerate(items):
             if item.get('vod_pic'):
-                item['vod_pic'] = self._cover_proxy(item['vod_pic'])
+                item['vod_pic'] = self._cover_proxy(item['vod_pic']) if index == 0 else ''
         return items
 
     def homeVideoContent(self):
@@ -282,62 +292,24 @@ class Spider(BaseSpider):
 
     def _diagnostic_cards(self):
         cards = []
-        def add(title, detail):
+        def add(title, detail, pic=''):
             cards.append({'vod_id': 'diagnostic', 'vod_name': title,
-                          'vod_pic': '', 'vod_remarks': str(detail)[:180]})
-        try:
-            method = getattr(self, 'getProxyUrl', None)
-            if not callable(method):
-                add('❌ 代理接口不存在', 'getProxyUrl 不存在，封面 URL 无法生成')
-            else:
-                try:
-                    proxy = method()
-                    add('代理地址：' + ('成功' if proxy else '为空'), str(proxy)[:160])
-                except Exception as e:
-                    add('❌ 代理接口报错', repr(e))
-        except Exception as e:
-            add('❌ 代理检查失败', repr(e))
-        try:
-            from Crypto.Cipher import AES
-            add('✅ AES 库可用', 'Crypto.Cipher')
-        except Exception:
-            try:
-                from Cryptodome.Cipher import AES
-                add('✅ AES 库可用', 'Cryptodome.Cipher')
-            except Exception:
-                try:
-                    from cryptography.hazmat.primitives.ciphers import Cipher
-                    add('✅ AES 库可用', 'cryptography')
-                except Exception:
-                    add('❌ AES 库不可用', '未找到 Crypto、Cryptodome 或 cryptography')
+                          'vod_pic': pic, 'vod_remarks': str(detail)[:180]})
         try:
             html = fetch(self, SITE + '/ai-duanju/')
             pic = next((i.get('vod_pic') for i in parse_cards(html) if i.get('vod_pic')), '')
             if not pic:
-                add('❌ 页面未提取到封面', 'HTML 长度=' + str(len(html)))
+                add('❌ 未提取到封面', '检查网页 HTML 结构')
+                return cards
+            add('已提取原图地址', pic[:160])
+            data_url = self._cover_proxy(pic)
+            if not data_url:
+                add('❌ 下载或解密失败', '无法生成 Base64 图片')
             else:
-                add('✅ 封面地址已提取', pic[:160])
-                try:
-                    r = self.net.req(pic, {'method': 'GET', 'timeout': 20000,
-                                           'headers': dict(HEADERS), 'buffer': 2})
-                    if isinstance(r, str): r = json.loads(r)
-                    if not isinstance(r, dict):
-                        add('❌ 图片请求返回异常', type(r).__name__)
-                    else:
-                        status = r.get('code', r.get('status', '未知'))
-                        raw = r.get('content', '')
-                        add('图片请求 HTTP ' + str(status), '返回类型=' + type(raw).__name__ + ' 长度=' + str(len(raw) if hasattr(raw, '__len__') else '?'))
-                        if str(status) == '200':
-                            try:
-                                result = decrypt_image(raw)
-                                add('✅ 图片解密成功' if result else '❌ 图片解密失败',
-                                    ('格式=' + result[0]) if result else '检查 AES 库、buffer 格式及密文')
-                            except Exception as e:
-                                add('❌ 图片解密异常', repr(e))
-                except Exception as e:
-                    add('❌ 图片下载异常', repr(e))
-        except Exception as e:
-            add('❌ 页面检查异常', repr(e))
+                add('Base64 图片显示测试', '如果此卡片有封面，说明 FongMi 支持 data URI', data_url)
+                add('已生成 Base64', '长度=' + str(len(data_url)) + '；若图片空白则播放器可能不支持 data URI')
+        except Exception as error:
+            add('❌ 测试异常', repr(error))
         return cards
 
     def categoryContent(self, tid, pg, filter=False, extend=None):
