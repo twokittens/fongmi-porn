@@ -83,8 +83,8 @@
       "ext": {}
     },
     {
-      "key": "huangguo_fongmiv7",
-      "name": "黄果短剧111111",
+      "key": "huangguo_fongmiv9",
+      "name": "黄果短剧",
       "type": 3,
       "api": "./huangguo_fongmi.py",
       "searchable": 1,
