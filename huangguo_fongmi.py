@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Huangguo FongMi Python Spider: direct data URI cover experiment."""
+"""Huangguo FongMi Python Spider: lazy cover proxy with AES-CBC decryption."""
 import re
 import json
 import base64
@@ -14,7 +14,7 @@ SITE = 'https://huangguoai.com'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 HEADERS = {'User-Agent': UA, 'Referer': SITE + '/', 'Accept-Language': 'zh-CN,zh;q=0.9'}
 CLASSES = [
-    {'type_id': 'hg-diagnostics', 'type_name': 'Base64封面测试'},
+    {'type_id': 'hg-diagnostics', 'type_name': '封面代理测试'},
     {'type_id': 'ai-duanju', 'type_name': 'AI成人短剧'},
     {'type_id': 'ai-manju', 'type_name': 'AI成人漫剧'},
     {'type_id': 'ai-huanlian', 'type_name': 'AI换脸'},
@@ -255,36 +255,20 @@ class Spider(BaseSpider):
         return {'class': CLASSES}
 
     def _cover_proxy(self, url):
-        """Directly decrypt a remote image and return a data URI (no proxy)."""
+        """Return a lazy-loading image proxy URL using the FongMi Python API."""
         if not url:
             return ''
         try:
-            response = self.net.req(url, {
-                'method': 'GET', 'timeout': 20000,
-                'headers': dict(HEADERS), 'buffer': 2
-            })
-            if isinstance(response, str):
-                response = json.loads(response)
-            if not isinstance(response, dict):
-                return ''
-            status = response.get('code', response.get('status', 0))
-            if str(status) != '200':
-                return ''
-            result = decrypt_image(response.get('content', ''))
-            if not result:
-                return ''
-            mime, encoded = result
-            return 'data:' + mime + ';base64,' + encoded
-        except Exception as error:
-            print('[HG-COVER] data URI failure:', repr(error))
+            return self.proxyUrl({'type': 'cover', 'url': url}, local=True)
+        except Exception as exc:
+            print('[HG-COVER] proxyUrl failed:', repr(exc))
             return ''
 
     def _proxy_pics(self, items):
-        # Keep the experiment small: one cover per listing page.
-        # This avoids downloading dozens of images during every category request.
-        for index, item in enumerate(items):
-            if item.get('vod_pic'):
-                item['vod_pic'] = self._cover_proxy(item['vod_pic']) if index == 0 else ''
+        for item in items:
+            original = item.get('vod_pic', '')
+            if original:
+                item['vod_pic'] = self._cover_proxy(original)
         return items
 
     def homeVideoContent(self):
@@ -299,17 +283,17 @@ class Spider(BaseSpider):
             html = fetch(self, SITE + '/ai-duanju/')
             pic = next((i.get('vod_pic') for i in parse_cards(html) if i.get('vod_pic')), '')
             if not pic:
-                add('❌ 未提取到封面', '检查网页 HTML 结构')
+                add('未提取到封面', '网页 HTML 中没有提取到封面地址')
                 return cards
-            add('已提取原图地址', pic[:160])
-            data_url = self._cover_proxy(pic)
-            if not data_url:
-                add('❌ 下载或解密失败', '无法生成 Base64 图片')
+            add('原图地址已提取', pic[:160])
+            proxy_url = self._cover_proxy(pic)
+            if not proxy_url:
+                add('代理地址生成失败', 'proxyUrl() 不可用或返回空值')
             else:
-                add('Base64 图片显示测试', '如果此卡片有封面，说明 FongMi 支持 data URI', data_url)
-                add('已生成 Base64', '长度=' + str(len(data_url)) + '；若图片空白则播放器可能不支持 data URI')
-        except Exception as error:
-            add('❌ 测试异常', repr(error))
+                add('代理封面显示测试', '若卡片出现图片，说明代理 URL 与 proxy() 已连通', proxy_url)
+                add('代理地址已生成', proxy_url[:170])
+        except Exception as exc:
+            add('测试异常', repr(exc))
         return cards
 
     def categoryContent(self, tid, pg, filter=False, extend=None):
@@ -364,28 +348,32 @@ class Spider(BaseSpider):
         url = extract_play(fetch(self, page_url, SITE + '/'), ep)
         return {'parse': 0, 'url': url, 'header': {'User-Agent': UA, 'Referer': SITE + '/'}}
 
-    def localProxy(self, param):
+    def proxy(self, params):
+        """FongMi proxy callback: return decrypted image bytes, not a data URI."""
+        if str((params or {}).get('type', '')) != 'cover':
+            return [404, 'text/plain', 'Unknown proxy type']
+        url = str((params or {}).get('url') or '')
+        if not url.startswith(('https://', 'http://')):
+            return [400, 'text/plain', 'Invalid image URL']
         try:
-            url = str((param or {}).get('url') or '')
-            if not url.startswith(('https://', 'http://')):
-                return [404, 'text/plain', 'Invalid image URL']
-            print('[HG-COVER] LOCAL PROXY REQUEST:', url.split('?', 1)[0])
             response = self.net.req(url, {
-                'method': 'GET', 'timeout': 15000,
+                'method': 'GET', 'timeout': 25000,
                 'headers': dict(HEADERS), 'buffer': 2
             })
             if isinstance(response, str):
                 response = json.loads(response)
-            print('[HG-COVER] FETCH RESPONSE:', type(response).__name__, 'code=', response.get('code') if isinstance(response, dict) else 'N/A')
-            if not isinstance(response, dict) or int(response.get('code', 0)) != 200:
-                return [404, 'text/plain', 'Image fetch failed']
+            if not isinstance(response, dict):
+                return [502, 'text/plain', 'Unexpected image response']
+            status = response.get('code', response.get('status', 0))
+            if str(status) != '200':
+                return [502, 'text/plain', 'Image download failed']
             result = decrypt_image(response.get('content', ''))
             if not result:
-                print('[HG-COVER] decrypt failed for:', url.split('?', 1)[0])
-                return [404, 'text/plain', 'Image decrypt failed']
-            mime, data = result
-            print('[HG-COVER] DECRYPT OK:', mime, 'base64_len=', len(data))
-            return [200, mime, data, {'Cache-Control': 'public, max-age=3600'}, 1]
-        except Exception as error:
-            print('[Huangguo] image proxy error:', str(error))
+                return [502, 'text/plain', 'Image decrypt failed']
+            mime, encoded = result
+            image_bytes = base64.b64decode(encoded)
+            return [200, mime, image_bytes,
+                    {'Cache-Control': 'public, max-age=3600'}]
+        except Exception as exc:
+            print('[HG-COVER] proxy error:', repr(exc))
             return [500, 'text/plain', 'Image proxy error']
