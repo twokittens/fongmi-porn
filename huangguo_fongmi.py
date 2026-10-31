@@ -50,19 +50,7 @@ def image_from_card(fragment):
     return ''
 
 def decrypt_image(raw):
-    """Decrypt Huangguo AES-CBC cover; return (MIME, base64 image)."""
-    if isinstance(raw, bytes):
-        try:
-            raw = raw.decode('ascii')
-        except Exception:
-            return None
-    raw = str(raw or '').strip()
-    if raw.startswith('data:image/') and ',' in raw:
-        raw = raw.split(',', 1)[1]
-    try:
-        payload = base64.b64decode(raw)
-    except (ValueError, binascii.Error):
-        return None
+    """FongMi buffer=2 supplies base64; decode AES-CBC/NoPadding image bytes."""
     def mime_of(data):
         if data.startswith(b'\xff\xd8\xff'):
             return 'image/jpeg'
@@ -73,41 +61,62 @@ def decrypt_image(raw):
         if data.startswith((b'GIF87a', b'GIF89a')):
             return 'image/gif'
         return ''
+
+    if isinstance(raw, (bytes, bytearray)):
+        payload = bytes(raw)
+        # Some bridges return base64 bytes instead of the original image bytes.
+        if not mime_of(payload) and len(payload) > 24 and re.fullmatch(rb'[A-Za-z0-9+/=\r\n]+', payload):
+            try:
+                payload = base64.b64decode(payload, validate=False)
+            except (ValueError, binascii.Error):
+                pass
+    elif isinstance(raw, str):
+        value = raw.strip()
+        if value.startswith('data:') and ',' in value:
+            value = value.split(',', 1)[1]
+        try:
+            payload = base64.b64decode(value, validate=True)
+        except (ValueError, binascii.Error):
+            print('[HG-COVER] buffer content is not base64')
+            return None
+    else:
+        print('[HG-COVER] unsupported content type:', type(raw).__name__)
+        return None
+
     mime = mime_of(payload)
     if mime:
         return mime, base64.b64encode(payload).decode('ascii')
-    if not payload or len(payload) % 16:
+    if not payload:
         return None
+
+    # CryptoJS NoPadding zero-fills a non-block-aligned final cipher block.
+    # The worker does the same and truncates plaintext to the original length.
+    original_length = len(payload)
+    padded = payload + bytes((-original_length) % 16)
     decrypted = None
     try:
         from Crypto.Cipher import AES
-        decrypted = AES.new(IMG_KEY, AES.MODE_CBC, IMG_IV).decrypt(payload)
+        decrypted = AES.new(IMG_KEY, AES.MODE_CBC, IMG_IV).decrypt(padded)
     except ImportError:
         try:
             from Cryptodome.Cipher import AES
-            decrypted = AES.new(IMG_KEY, AES.MODE_CBC, IMG_IV).decrypt(payload)
+            decrypted = AES.new(IMG_KEY, AES.MODE_CBC, IMG_IV).decrypt(padded)
         except ImportError:
             try:
                 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-                decryptor = Cipher(algorithms.AES(IMG_KEY), modes.CBC(IMG_IV)).decryptor()
-                decrypted = decryptor.update(payload) + decryptor.finalize()
+                dec = Cipher(algorithms.AES(IMG_KEY), modes.CBC(IMG_IV)).decryptor()
+                decrypted = dec.update(padded) + dec.finalize()
             except ImportError:
+                print('[HG-COVER] no AES library available')
                 return None
-    if not decrypted:
+    if decrypted is None:
         return None
-    pad = decrypted[-1]
-    if 1 <= pad <= 16 and decrypted.endswith(bytes([pad]) * pad):
-        decrypted = decrypted[:-pad]
-    if decrypted.startswith(b'\xff\xd8'):
-        end = decrypted.rfind(b'\xff\xd9')
-        if end >= 0:
-            decrypted = decrypted[:end + 2]
-    elif decrypted.startswith(b'\x89PNG'):
-        end = decrypted.rfind(b'IEND\xaeB`\x82')
-        if end >= 0:
-            decrypted = decrypted[:end + 8]
+    decrypted = decrypted[:original_length]
     mime = mime_of(decrypted)
-    return (mime, base64.b64encode(decrypted).decode('ascii')) if mime else None
+    if not mime:
+        print('[HG-COVER] decrypted bytes not recognized as image; size:', original_length)
+        return None
+    return mime, base64.b64encode(decrypted).decode('ascii')
 
 def fetch(spider, url, referer=None):
     headers = dict(HEADERS)
@@ -327,6 +336,7 @@ class Spider(BaseSpider):
                 return [404, 'text/plain', 'Image fetch failed']
             result = decrypt_image(response.get('content', ''))
             if not result:
+                print('[HG-COVER] decrypt failed for:', url.split('?', 1)[0])
                 return [404, 'text/plain', 'Image decrypt failed']
             mime, data = result
             return [200, mime, data, {'Cache-Control': 'public, max-age=3600'}, 1]
