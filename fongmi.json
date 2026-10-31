@@ -84,7 +84,7 @@
     },
     {
       "key": "huangguo_fongmi",
-      "name": "黄果短剧11",
+      "name": "黄果短剧21",
       "type": 3,
       "api": "./huangguo_fongmi.py",
       "searchable": 1,
