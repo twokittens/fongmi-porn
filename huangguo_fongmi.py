@@ -152,9 +152,11 @@ def page_count(page, default=1):
     nums = [1]
     for href in re.findall(r"href=[\"']([^\"']+)", page or '', re.I):
         path = html_lib.unescape(href).split('?', 1)[0].rstrip('/')
-        m = re.search(r'/page/(\d+)$', path, re.I)
-        if not m:
-            m = re.search(r'/(\d+)$', path)
+        # Ignore video/detail IDs and unrelated numeric URLs; only accept
+        # pagination-shaped links. The category site uses /category/2/.
+        if re.search(r'/(?:video|detail|tag|search)(?:/|$)', path, re.I):
+            continue
+        m = re.search(r'/page/(\d+)$', path, re.I) or re.search(r'/(\d+)$', path)
         if m:
             try:
                 nums.append(int(m.group(1)))
@@ -169,8 +171,9 @@ def page_count(page, default=1):
 
 
 def category_page_url(path, page):
+    """The site's category pagination uses /<category>/<page>/, not /page/<N>/."""
     base = SITE + '/' + str(path).strip('/') + '/'
-    return base if page <= 1 else base + 'page/' + str(page) + '/'
+    return base if page <= 1 else base + str(page) + '/'
 
 
 def tag_page_url(slug, page):
