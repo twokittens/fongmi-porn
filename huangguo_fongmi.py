@@ -148,25 +148,34 @@ def blocks(text, marker):
     return [text[starts[i]:(starts[i + 1] if i + 1 < len(starts) else len(text))] for i in range(len(starts))]
 
 def page_count(page, default=1):
-    """Read the last page number from the site's rendered pagination links."""
+    """Read the site's explicit pager page count, then fall back to pager URLs."""
+    source = page or ''
+    # Tag archives expose the authoritative page count in hg-pager__jump.
+    m = re.search(
+        r'<(?:span|div)\b(?=[^>]*class=["\'][^"\']*\bhg-pager__jump\b[^"\']*["\'])'
+        r'[^>]*\bdata-pages=["\'](\d+)["\']',
+        source, re.I | re.S
+    )
+    if m:
+        return max(1, int(m.group(1)))
+
     nums = [1]
-    for href in re.findall(r"href=[\"']([^\"']+)", page or '', re.I):
+    for href in re.findall(r'href=["\']([^"\']+)', source, re.I):
         path = html_lib.unescape(href).split('?', 1)[0].rstrip('/')
-        # Ignore video/detail IDs and unrelated numeric URLs; only accept
-        # pagination-shaped links. The category site uses /category/2/.
         if re.search(r'/(?:video|detail|search)(?:/|$)', path, re.I):
             continue
-        m = re.search(r'/page/(\d+)$', path, re.I) or re.search(r'/(\d+)$', path)
+        m = re.search(r'/page/(\d+)$', path, re.I)
         if m:
-            try:
+            nums.append(int(m.group(1)))
+        elif re.search(r'/tag/', path, re.I):
+            continue
+        else:
+            m = re.search(r'/(\d+)$', path)
+            if m:
                 nums.append(int(m.group(1)))
-            except ValueError:
-                pass
-    # Also support explicit total-page metadata when present.
     for pat in (r'data-total-pages=["\'](\d+)', r'"total_pages"\s*:\s*(\d+)',
                 r'"pagecount"\s*:\s*(\d+)'):
-        for value in re.findall(pat, page or '', re.I):
-            nums.append(int(value))
+        nums.extend(int(value) for value in re.findall(pat, source, re.I))
     return max(nums) if len(nums) > 1 else default
 
 
@@ -177,10 +186,9 @@ def category_page_url(path, page):
 
 
 def tag_page_url(slug, page):
-    # Tag archives use the same numeric suffix pagination as the original
-    # site route: /tag/<slug>/2/, /tag/<slug>/3/, etc.
+    """Tag archives use /tag/<slug>/page/<N>/, unlike category archives."""
     base = SITE + '/tag/' + slug.strip('/') + '/'
-    return base if page <= 1 else base + str(page) + '/'
+    return base if page <= 1 else base + 'page/' + str(page) + '/'
 
 
 def parse_cards(page, all_grids=False):
