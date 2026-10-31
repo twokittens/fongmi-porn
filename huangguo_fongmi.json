@@ -2,9 +2,9 @@
   "sites": [
     {
       "key": "huangguo_python1111",
-      "name": "黄果短剧test11",
+      "name": "黄果短剧测试",
       "type": 3,
-      "api": "./test.py",
+      "api": "./missav.py",
       "searchable": 1,
       "quickSearch": 0,
       "filterable": 0,
