@@ -14,7 +14,6 @@ SITE = 'https://huangguoai.com'
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 HEADERS = {'User-Agent': UA, 'Referer': SITE + '/', 'Accept-Language': 'zh-CN,zh;q=0.9'}
 CLASSES = [
-    {'type_id': 'hg-diagnostics', 'type_name': '封面代理测试'},
     {'type_id': 'ai-duanju', 'type_name': 'AI成人短剧'},
     {'type_id': 'ai-manju', 'type_name': 'AI成人漫剧'},
     {'type_id': 'ai-huanlian', 'type_name': 'AI换脸'},
@@ -195,6 +194,34 @@ def parse_ranks(page):
             break
     return result
 
+def api_cards(data):
+    """Convert the site's category JSON items into FongMi VOD cards."""
+    if not isinstance(data, dict):
+        return []
+    raw_items = data.get('items') or data.get('list') or []
+    result, seen = [], set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        vid = str(item.get('id') or item.get('video_id') or '')
+        title = clean(str(item.get('title') or item.get('name') or ''))
+        if not vid or not vid.isdigit() or not title or vid in seen:
+            continue
+        pic = item.get('cover') or item.get('cover_src') or item.get('image') or ''
+        tags = item.get('tags') or []
+        if isinstance(tags, str):
+            tags = [x.strip() for x in re.split(r'[,，、|]', tags) if x.strip()]
+        episode_count = item.get('episode_count') or item.get('total_episodes') or 0
+        finished = bool(item.get('is_finished'))
+        remarks = ('全%s集' % episode_count) if finished and episode_count else (('更新至%s集' % episode_count) if episode_count else '')
+        score = item.get('score')
+        if score:
+            remarks = ' · '.join(x for x in (remarks, str(score) + '分') if x)
+        result.append({'vod_id': vid, 'vod_name': title, 'vod_pic': cover(pic),
+                       'vod_remarks': remarks})
+        seen.add(vid)
+    return result
+
 def initial_data(page):
     raw = match(r'<script\b[^>]*id=["\']videoInitialData["\'][^>]*>(.*?)</script>', page)
     try:
@@ -252,69 +279,75 @@ class Spider(BaseSpider):
         pass
 
     def homeContent(self, filter=False):
-        return {'class': CLASSES}
+        filters = {}
+        choices = [
+            {'n': '最近更新', 'v': 'latest'},
+            {'n': '当前热播', 'v': 'hot_window'},
+            {'n': '集数最多', 'v': 'episode_count'},
+        ]
+        for item in CLASSES:
+            if item['type_id'] != 'ranks/hot':
+                filters[item['type_id']] = [{
+                    'key': 'sort', 'name': '排序', 'init': 'latest', 'value': choices
+                }]
+        return {'class': CLASSES, 'filters': filters}
 
-    def _cover_proxy(self, url):
-        """Return a lazy-loading image proxy URL using the FongMi Python API."""
-        if not url:
-            return ''
+    def _api_category(self, tid, page, sort):
+        api = SITE + '/api/videos/category/' + quote(str(tid), safe='')
+        params = []
+        if sort and sort != 'latest':
+            params.append('sort=' + quote(sort, safe='_'))
+        params.extend(['page=' + str(page), 'size=21'])
+        raw = fetch(self, api + '?' + '&'.join(params))
         try:
-            return self.proxyUrl({'type': 'cover', 'url': url}, local=True)
-        except Exception as exc:
-            print('[HG-COVER] proxyUrl failed:', repr(exc))
-            return ''
-
-    def _proxy_pics(self, items):
-        for item in items:
-            original = item.get('vod_pic', '')
-            if original:
-                item['vod_pic'] = self._cover_proxy(original)
-        return items
-
-    def homeVideoContent(self):
-        return {'list': self._proxy_pics(parse_cards(fetch(self, SITE + '/'), True))}
-
-    def _diagnostic_cards(self):
-        cards = []
-        def add(title, detail, pic=''):
-            cards.append({'vod_id': 'diagnostic', 'vod_name': title,
-                          'vod_pic': pic, 'vod_remarks': str(detail)[:180]})
-        try:
-            html = fetch(self, SITE + '/ai-duanju/')
-            pic = next((i.get('vod_pic') for i in parse_cards(html) if i.get('vod_pic')), '')
-            if not pic:
-                add('未提取到封面', '网页 HTML 中没有提取到封面地址')
-                return cards
-            add('原图地址已提取', pic[:160])
-            proxy_url = self._cover_proxy(pic)
-            if not proxy_url:
-                add('代理地址生成失败', 'proxyUrl() 不可用或返回空值')
-            else:
-                add('代理封面显示测试', '若卡片出现图片，说明代理 URL 与 proxy() 已连通', proxy_url)
-                add('代理地址已生成', proxy_url[:170])
-        except Exception as exc:
-            add('测试异常', repr(exc))
-        return cards
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        payload = data.get('data') if isinstance(data, dict) else None
+        if not isinstance(payload, dict):
+            payload = data if isinstance(data, dict) else {}
+        items = api_cards(payload)
+        total = int(payload.get('total') or payload.get('total_count') or payload.get('totalItems') or 0)
+        pages = int(payload.get('pages') or payload.get('total_pages') or 0)
+        if not pages and total:
+            pages = (total + 20) // 21
+        return items, pages or (page + 1 if len(items) >= 21 else page), total
 
     def categoryContent(self, tid, pg, filter=False, extend=None):
         try:
             page = max(1, int(pg or 1))
         except (ValueError, TypeError):
             page = 1
-        if tid == 'hg-diagnostics':
-            cards = self._diagnostic_cards()
-            return {'list': cards, 'page': 1, 'pagecount': 1, 'limit': len(cards), 'total': len(cards)}
         if tid == 'ranks/hot':
-            return {'list': self._proxy_pics(parse_ranks(fetch(self, SITE + '/ranks/hot/'))), 'page': 1, 'pagecount': 1, 'limit': 20, 'total': 20}
+            items = self._proxy_pics(parse_ranks(fetch(self, SITE + '/ranks/hot/')))
+            return {'list': items, 'page': 1, 'pagecount': 1, 'limit': 20, 'total': 20}
+
+        # Tag IDs are generated by self.link() on the detail page.
+        if str(tid).startswith('tag/'):
+            slug = str(tid).split('/', 1)[1].strip('/')
+            if not re.fullmatch(r'[A-Za-z0-9_-]+', slug):
+                return {'list': [], 'page': page, 'pagecount': page}
+            url = SITE + '/tag/' + slug + '/' + (str(page) + '/' if page > 1 else '')
+            items = self._proxy_pics(parse_cards(fetch(self, url)))
+            return {'list': items, 'page': page, 'pagecount': page + 1 if items else page,
+                    'limit': len(items) or 20, 'total': (page + 1) * len(items) if items else page * 20}
+
         path = str(tid or '').strip('/')
+        sort = ''
+        if isinstance(extend, dict):
+            sort = str(extend.get('sort') or '')
+        if sort in ('hot_window', 'episode_count'):
+            items, pages, total = self._api_category(path, page, sort)
+            return {'list': self._proxy_pics(items), 'page': page, 'pagecount': pages,
+                    'limit': 21, 'total': total or pages * 21}
+
         url = SITE + '/' + path + '/' + (str(page) + '/' if page > 1 else '')
         items = self._proxy_pics(parse_cards(fetch(self, url)))
-        return {'list': items, 'page': page, 'pagecount': page + 1 if items else page, 'limit': len(items) or 20, 'total': (page + 1) * len(items) if items else page * 20}
+        return {'list': items, 'page': page, 'pagecount': page + 1 if items else page,
+                'limit': len(items) or 20, 'total': (page + 1) * len(items) if items else page * 20}
 
     def detailContent(self, ids):
         vid = str(ids[0] if isinstance(ids, (list, tuple)) and ids else ids or '').strip()
-        if vid == 'diagnostic':
-            return {'list': [{'vod_id': vid, 'vod_name': '封面诊断', 'vod_content': '\n'.join(x['vod_name'] + ': ' + x['vod_remarks'] for x in self._diagnostic_cards()), 'vod_play_from': '诊断', 'vod_play_url': ''}]}
         if not re.fullmatch(r'\d+', vid):
             return {'list': []}
         page = fetch(self, SITE + '/video/' + vid + '/')
@@ -326,7 +359,30 @@ class Spider(BaseSpider):
         if not pic:
             pic = match(r'<meta\b[^>]*content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']og:image["\']', page)
         playlist = ['第%s集$%s|||%s' % (ep, url, ep) for ep, url in episodes(page, vid)]
-        return {'list': [{'vod_id': vid, 'vod_name': title, 'vod_pic': self._cover_proxy(cover(pic)), 'vod_play_from': '黄果', 'vod_play_url': '#'.join(playlist)}]}
+        tag_links = []
+        tag_names = []
+        # Only read the current drama's tags; recommendation-card tags are elsewhere.
+        tag_block = match(
+            r"<div\\b(?=[^>]*class=[\\\"'][^\\\"']*\\bhg-web-play__tags\\b[^\\\"']*[\\\"'])[^>]*>(.*?)</div>",
+            page
+        )
+        for tag_match in re.finditer(
+            r"<a\\b[^>]*href=[\\\"']([^\\\"']*/tag/([A-Za-z0-9_-]+)/?)[\\\"'][^>]*>(.*?)</a>",
+            tag_block, re.I | re.S
+        ):
+            slug, name = tag_match.group(2), clean(tag_match.group(3))
+            if name and slug and name not in tag_names:
+                tag_names.append(name)
+                try:
+                    tag_links.append(self.link(name, {'id': 'tag/' + slug}))
+                except Exception:
+                    tag_links.append(name)
+        vod = {'vod_id': vid, 'vod_name': title, 'vod_pic': self._cover_proxy(cover(pic)),
+               'vod_play_from': '黄果', 'vod_play_url': '#'.join(playlist)}
+        if tag_links:
+            vod['vod_actor'] = '、'.join(tag_links)
+            vod['vod_content'] = '相关标签：' + '、'.join(tag_names)
+        return {'list': [vod]}
 
     def searchContent(self, key, quick=False, pg='1'):
         try:
