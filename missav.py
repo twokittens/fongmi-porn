@@ -962,7 +962,8 @@ class Spider(BaseSpider):
             sort = str(selected.get('sort', '') or '')
             work_filter = str(selected.get('work_filter', '') or '')
             result = self._list(append_options(tid, sort, [work_filter]), pg)
-            result['filters'] = {str(tid): category_filter_config()}
+            # Hint only: clients that ignore filters in category responses
+            # cannot be forced to show a native filter bar by a Spider.
             return result
         kind = special_kind(tid)
         if kind:
@@ -1099,7 +1100,12 @@ class Spider(BaseSpider):
         def clickable_entities(items):
             links = []
             for display_name, entity_url in items:
-                target = {'id': entity_url, 'name': display_name, 'type_flag': 1}
+                target = {
+                    'id': entity_url,
+                    'name': display_name,
+                    'type_flag': 1,
+                    'filter': category_filter_config(),
+                }
                 try:
                     links.append(self.link(display_name, target))
                 except Exception:
