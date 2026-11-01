@@ -1,122 +1,1320 @@
 # -*- coding: utf-8 -*-
+"""MissAV FongMi Python Spider v1.5.9 (clickable video metadata categories)."""
+import re
+import html
+import json
+import hmac
+import hashlib
+import time
+import uuid
+import urllib.request
+import urllib.error
+from urllib.parse import urljoin, urlparse, quote, urlencode, parse_qs, unquote, urlsplit, urlunsplit, parse_qsl
+from html.parser import HTMLParser
 from base.spider import Spider as BaseSpider
 
-HOST = "https://missav.ai/"
+HOST = 'https://missav.ai'
+CATEGORIES = [
+    {'type_id': '/dm301/cn/today-hot', 'type_name': '今日热门'},
+    {'type_id': '/dm170/cn/weekly-hot', 'type_name': '本周热门'},
+    {'type_id': '/dm273/cn/monthly-hot', 'type_name': '本月热门'},    
+    {'type_id': '/dm817/cn/uncensored-leak', 'type_name': '无码流出'},
+    {'type_id': '/dm278/cn/chinese-subtitle', 'type_name': '中文字幕'},
+    {'type_id': '/dm539/cn/new', 'type_name': '最新更新'},
+    {'type_id': '/dm635/cn/release', 'type_name': '新作上市'},
+    {'type_id': '/dm63/cn/madou', 'type_name': '麻豆传媒'},
+    {'type_id': '/cn/klive', 'type_name': '韩国直播'},
+    {'type_id': '/cn/clive', 'type_name': '中国直播'},
+    {'type_id': '/dm597/cn/fc2', 'type_name': 'FC2'},
+    {'type_id': '/dm2208642/cn/heyzo', 'type_name': 'HEYZO'},
+    {'type_id': '/dm42/cn/tokyohot', 'type_name': '东京热'},
+    {'type_id': '/dm4551174/cn/1pondo', 'type_name': '一本道'},
+    {'type_id': '/cn/actresses', 'type_name': '女优一览', 'type_flag': 1},
+    {'type_id': '/cn/actresses/ranking', 'type_name': '女优排行', 'type_flag': 1},
+    {'type_id': '/dm6840521/cn/caribbeancom', 'type_name': 'Caribbeancom'},
+    {'type_id': '/dm91887/cn/caribbeancompr', 'type_name': 'Caribbeancompr'},
+    {'type_id': '/dm6238682/cn/10musume', 'type_name': '10musume'},
+    {'type_id': '/dm3600557/cn/pacopacomama', 'type_name': 'pacopacomama'},
+    {'type_id': '/dm150/cn/gachinco', 'type_name': 'gachinco'},
+    {'type_id': '/dm42/cn/xxxav', 'type_name': 'xxxav'},
+    {'type_id': '/dm37/cn/marriedslash', 'type_name': '人妻斩'},
+    {'type_id': '/dm33/cn/naughty4610', 'type_name': '顽皮4160'},
+    {'type_id': '/dm37/cn/naughty0930', 'type_name': '顽皮0930'},
+    {'type_id': '/cn/genres', 'type_name': '类型', 'type_flag': 1},
+    {'type_id': '/cn/makers', 'type_name': '发行商', 'type_flag': 1},
+]
+SPECIAL_PATHS = ('/cn/actresses', '/cn/actresses/ranking', '/cn/genres', '/cn/makers')
+
+# Site-side sorting and filtering. Values supplied by the site user.
+SORT_OPTIONS = [
+    ('最近更新', 'published_at'), ('发行日期', 'released_at'),
+    ('收藏最多', 'saved'), ('今日浏览', 'today_views'),
+    ('本周浏览', 'weekly_views'), ('本月浏览', 'monthly_views'),
+    ('总浏览', 'views'),
+]
+CATEGORY_FILTER_OPTIONS = [
+    ('单人作品', 'individual'), ('多人作品', 'multiple'),
+    ('中文字幕', 'chinese-subtitle'),
+]
+SEARCH_FILTER_OPTIONS = [
+    ('单人作品', 'individual'), ('日本AV', 'jav'),
+    ('亚洲AV', 'asiaav'), ('无码流出', 'uncensored-leak'),
+    ('无码影片', 'uncensored'), ('中文字幕', 'chinese-subtitle'),
+]
+
+
+def special_kind(path):
+    p = urlsplit(absolute(path)).path.rstrip('/')
+    if p == '/cn/actresses/ranking':
+        return 'actresses'
+    if p in ('/cn/actresses', '/cn/genres', '/cn/makers'):
+        return p.split('/')[-1]
+    return ''
+
+
+def parse_directory(source, kind):
+    """Parse directory cards using real MissAV markup; preserve source ordering.
+
+    In actress cards, h4 is the name, img.alt is the fallback; p contains
+    video counts/debut years and ranking badges are NOT names.
+    """
+    records = {}
+
+    def plain(value):
+        value = re.sub(r'<[^>]+>', ' ', str(value or ''))
+        return re.sub(r'\s+', ' ', html.unescape(value)).strip()
+
+    def attr(markup, key):
+        match = re.search(r'(?<![\w-])' + re.escape(key) +
+                          r'\s*=\s*([\x22\x27])(.*?)\1', markup, re.I | re.S)
+        return html.unescape(match.group(2)).strip() if match else ''
+
+    pattern = (r'<a\b(?P<attrs>[^>]*?)\bhref\s*=\s*'
+               r'(?P<q>[\x22\x27]?)(?P<href>[^\s\x22\x27>]+)(?P=q)'
+               r'[^>]*>(?P<body>.*?)</a\s*>')
+    for match in re.finditer(pattern, source, re.I | re.S):
+        url = absolute(match.group('href'))
+        path = urlsplit(url).path.rstrip('/')
+        if not re.search(r'(?:/dm\d+)?/cn/' + re.escape(kind) + r'/[^/]+$', path, re.I):
+            continue
+        if kind == 'actresses' and path.endswith('/ranking'):
+            continue
+        body = match.group('body')
+        entry = records.setdefault(url, {'name': '', 'name_priority': 0, 'pic': '', 'count': ''})
+
+        img = re.search(r'<img\b([^>]*)>', body, re.I | re.S)
+        if img:
+            image_attrs = img.group(1)
+            if not entry['pic']:
+                for key in ('data-src', 'data-original', 'data-lazy-src', 'src'):
+                    pic = attr(image_attrs, key)
+                    if pic and not pic.startswith('data:'):
+                        entry['pic'] = absolute(pic)
+                        break
+            img_name = attr(image_attrs, 'alt') or attr(image_attrs, 'title')
+            if img_name and entry['name_priority'] < 90:
+                entry['name'], entry['name_priority'] = img_name, 90
+
+        # Actual actress/ranking HTML uses <h4>NAME</h4>, followed by
+        # <p>5701 条影片</p> and <p>2008 出道</p>. Never select those p labels.
+        headings = re.findall(r'<h[1-6]\b[^>]*>(.*?)</h[1-6]\s*>', body, re.I | re.S)
+        if headings:
+            heading = plain(headings[0])
+            if heading:
+                entry['name'], entry['name_priority'] = heading, 120
+        elif kind != 'actresses':
+            # For genre/maker pages, span or plain anchor text may be the label.
+            spans = re.findall(r'<span\b[^>]*>(.*?)</span\s*>', body, re.I | re.S)
+            for candidate in spans + [body]:
+                label = plain(candidate)
+                label = re.sub(r'\s*\d[\d,]*\s*(?:条影片|部影片|部作品|个视频)\s*$', '', label)
+                if label and not re.fullmatch(r'\d[\d,]*', label) and entry['name_priority'] < 50:
+                    entry['name'], entry['name_priority'] = label, 50
+                    break
+
+        count = re.search(r'(\d[\d,]*)\s*(?:条影片|部影片|部作品|个视频|videos?|movies?)', plain(body), re.I)
+        if count:
+            entry['count'] = count.group(1).replace(',', '')
+
+    result = []
+    for url, entry in records.items():
+        name = entry['name']
+        if not name:
+            name = unquote(urlsplit(url).path.rstrip('/').split('/')[-1]).replace('-', ' ').replace('_', ' ')
+        actress = kind == 'actresses'
+        result.append({
+            'vod_id': url, 'vod_name': name,
+            'vod_pic': entry['pic'] if actress else '',
+            'vod_tag': 'folder', 'cate': {},
+            'style': {'type': 'oval', 'ratio': 1.0} if actress else {'type': 'rect', 'ratio': 4.0},
+            # FongMi oval cards may display remarks instead of the main name.
+            'vod_remarks': name if actress else (entry['count'] + ' 部影片' if entry['count'] else '')
+        })
+    return result
+
+
+def parse_search_actresses(source):
+    """Only include actress links actually present in the returned search HTML."""
+    class ActressLinks(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.active = []
+            self.records = []
+
+        def handle_starttag(self, tag, attrs):
+            a = dict(attrs)
+            if tag == 'a':
+                href = a.get('href', '')
+                path = urlsplit(absolute(href)).path.rstrip('/')
+                ok = bool(re.fullmatch(r'(?:/dm\d+)?/cn/actresses/[^/]+', path, re.I))
+                self.active.append({'href': href, 'name': a.get('title', ''),
+                                    'pic': '', 'text': [], 'ok': ok})
+            elif tag == 'img' and self.active and self.active[-1]['ok']:
+                card = self.active[-1]
+                card['name'] = card['name'] or a.get('alt', '')
+                for key in ('data-src', 'data-original', 'data-lazy-src', 'src'):
+                    pic = a.get(key, '')
+                    if pic and not pic.startswith(('data:', 'blob:')):
+                        card['pic'] = absolute(pic)
+                        break
+
+        def handle_data(self, data):
+            if self.active:
+                self.active[-1]['text'].append(data)
+
+        def handle_endtag(self, tag):
+            if tag == 'a' and self.active:
+                card = self.active.pop()
+                if card['ok']:
+                    self.records.append(card)
+
+    parser = ActressLinks()
+    parser.feed(source)
+    result, seen = [], set()
+    for card in parser.records:
+        url = absolute(card['href'])
+        if url in seen:
+            continue
+        seen.add(url)
+        name = re.sub(r'\s+', ' ', html.unescape(card['name'] or ''.join(card['text']))).strip()
+        if not name:
+            name = unquote(urlsplit(url).path.rstrip('/').split('/')[-1]).replace('-', ' ')
+        result.append({'vod_id': url, 'vod_name': name,
+                       'vod_pic': card['pic'], 'vod_remarks': name,
+                       'vod_tag': 'folder', 'cate': {},
+                       'style': {'type': 'oval', 'ratio': 1.0}})
+    return result
+
+
+def filter_choices(options):
+    return [{'n': '全部', 'v': ''}] + [{'n': n, 'v': v} for n, v in options]
+
+
+def category_filter_config():
+    return [
+        {'key': 'sort', 'name': '排序', 'value': filter_choices(SORT_OPTIONS)},
+        {'key': 'work_filter', 'name': '作品过滤', 'value': filter_choices(CATEGORY_FILTER_OPTIONS)},
+    ]
+
+
+def append_options(path, sort='', filters=()):
+    """Append site query parameters without destroying existing page parameters."""
+    parts = urlsplit(path)
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+             if k not in ('sort', 'filters', 'page')]
+    if sort in {v for _, v in SORT_OPTIONS}:
+        query.append(('sort', sort))
+    allowed = {v for _, v in CATEGORY_FILTER_OPTIONS + SEARCH_FILTER_OPTIONS}
+    for value in dict.fromkeys(filters):
+        if value in allowed:
+            query.append(('filters', value))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(query), parts.fragment))
+
+
+def parse_search_expression(text):
+    """Search syntax: JUR-857|sort=views|filters=chinese-subtitle,jav.
+
+    SearchContent has no `extend` argument in the standard Spider interface.
+    This keeps native search usable without pretending it supports filter UI.
+    """
+    chunks = str(text or '').split('|')
+    keyword = chunks[0].strip()
+    sort = ''
+    filters = []
+    allowed = {v for _, v in SEARCH_FILTER_OPTIONS}
+    for chunk in chunks[1:]:
+        key, sep, value = chunk.strip().partition('=')
+        if not sep:
+            continue
+        key, value = key.strip().lower(), value.strip()
+        if key == 'sort' and value in {v for _, v in SORT_OPTIONS}:
+            sort = value
+        elif key in ('filters', 'filter'):
+            filters.extend(v for v in re.split(r'[,;+]', value) if v in allowed)
+    return keyword, sort, list(dict.fromkeys(filters))
+
+
+UA = ('Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36')
+
+
+def absolute(url):
+    return urljoin(HOST + '/', html.unescape(str(url or '')))
+
+
+def valid_video(url):
+    """Accept video detail paths without imposing a narrow code regex.
+
+    MissAV has nonstandard codes and suffixes; a restrictive pattern can
+    silently discard legitimate search hits.
+    """
+    parsed = urlparse(absolute(url))
+    if parsed.hostname not in ('missav.ai', 'www.missav.ai'):
+        return False
+    path = re.sub(r'^/dm\d+', '', parsed.path, flags=re.I)
+    path = re.sub(r'^/(?:cn|en|ja)(?=/|$)', '', path, flags=re.I).strip('/')
+    if not path or '/' in path:
+        return False
+    blocked = {'search', 'tags', 'tag', 'actresses', 'actress', 'genres',
+               'genre', 'makers', 'maker', 'labels', 'label', 'series',
+               'login', 'register', 'favorites', 'history', 'saved',
+               'chinese-subtitle', 'uncensored-leak', 'uncensored',
+               'jav', 'asiaav', 'individual', 'multiple', 'new'}
+    return path.lower() not in blocked and bool(re.search(r'\d', path))
+
+
+RECOMMEND_PREFIX = 'missavrecommend:'
+
+
+def parse_recommendation_cards(source, current_url, limit=40):
+    """Only actual server-rendered Recombee recommendation links; never invent URLs."""
+    from html.parser import HTMLParser
+
+    class Finder(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.stack = []
+            self.cards = []
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == 'a':
+                href = html.unescape(attrs.get('href', ''))
+                frag = urlsplit(href).fragment.lower()
+                eligible = any(x in frag for x in (
+                    'watch-next-side', 'watch-next-bottom', 'mobile-watch-next'))
+                self.stack.append({'href': href.split('#', 1)[0], 'ok': eligible,
+                                   'name': attrs.get('title', ''), 'pic': '', 'text': []})
+            elif tag == 'img' and self.stack and self.stack[-1]['ok']:
+                a = self.stack[-1]
+                a['pic'] = (attrs.get('data-src') or attrs.get('data-original')
+                            or attrs.get('src') or '')
+                a['name'] = a['name'] or attrs.get('alt', '')
+
+        def handle_data(self, data):
+            if self.stack:
+                self.stack[-1]['text'].append(data)
+
+        def handle_endtag(self, tag):
+            if tag == 'a' and self.stack:
+                item = self.stack.pop()
+                if item['ok']:
+                    self.cards.append(item)
+
+    finder = Finder()
+    finder.feed(source)
+    current = absolute(current_url).split('#', 1)[0]
+    cards, seen = [], set()
+    for item in finder.cards:
+        url = absolute(item['href'])
+        if not valid_video(url) or url == current or url in seen:
+            continue
+        seen.add(url)
+        name = re.sub(r'\s+', ' ', item['name'] or ' '.join(item['text'])).strip()
+        cards.append({'vod_id': url,
+                      'vod_name': name or unquote(urlsplit(url).path.split('/')[-1]),
+                      'vod_pic': absolute(item['pic']) if item['pic'] and not item['pic'].startswith('data:') else '',
+                      'vod_remarks': unquote(urlsplit(url).path.split('/')[-1]).upper(),
+                      'style': {'type': 'rect', 'ratio': 1.78}})
+        if len(cards) >= limit:
+            break
+    return cards
+
+
+# Public browser token embedded in the supplied MissAV JavaScript bundle.
+RECOMBEE_PUBLIC_TOKEN = 'Ikkg568nlM51RHvldlPvc2GzZPE9R4XGzaH9Qj4zK9npbbbTly1gj9K4mgRn0QlV'
+RECOMBEE_API = 'https://client-rapi-missav.recombee.com'
+RECOMBEE_PROPERTIES = ['title_cn', 'duration', 'has_chinese_subtitle',
+                       'has_english_subtitle', 'is_uncensored_leak', 'dm']
+
+
+def recombee_signed_url(timestamp=None):
+    timestamp = int(time.time()) if timestamp is None else int(timestamp)
+    path = '/missav-default/batch/?frontend_timestamp=' + str(timestamp)
+    digest = hmac.new(RECOMBEE_PUBLIC_TOKEN.encode('utf-8'),
+                      path.encode('utf-8'), hashlib.sha1).hexdigest()
+    return RECOMBEE_API + path + '&frontend_sign=' + digest
+
+
+def recombee_payload(code, user_id):
+    requests = []
+    for scenario, count in [('desktop-watch-next-side', 13),
+                            ('desktop-watch-next-bottom', 16)]:
+        requests.append({
+            'method': 'POST',
+            'path': '/recomms/items/{}/items/'.format(quote(code.lower(), safe='')),
+            'params': {'targetUserId': user_id, 'count': count,
+                       'scenario': scenario, 'returnProperties': True,
+                       'includedProperties': RECOMBEE_PROPERTIES,
+                       'cascadeCreate': True}
+        })
+    return {'requests': requests, 'distinctRecomms': True}
+
+
+def parse_recombee_results(payload, current_code, limit=40):
+    cards, seen = [], set()
+    if isinstance(payload, dict):
+        payload = payload.get('results', payload.get('responses', []))
+    if not isinstance(payload, list):
+        return cards
+    for batch in payload:
+        if not isinstance(batch, dict) or int(batch.get('code', 200)) != 200:
+            continue
+        result = batch.get('json', {})
+        if not isinstance(result, dict):
+            continue
+        for item in result.get('recomms', []):
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get('id', '')).strip().lower()
+            if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{1,100}', code):
+                continue
+            if code == current_code.lower() or code in seen:
+                continue
+            values = item.get('values') or {}
+            if not isinstance(values, dict):
+                values = {}
+            seen.add(code)
+            # The API returns a code, not a complete /dmNN/ video path.
+            # Use the site's canonical /cn/<code> route as the starting point.
+            suffix = '-uncensored-leak' if values.get('is_uncensored_leak') and not code.endswith('-uncensored-leak') else ''
+            target = HOST + '/cn/' + code + suffix
+            # Site covers commonly use the /<code>/cover-n.jpg convention.
+            # This is a best-effort URL, not a cover URL supplied by Recombee.
+            pic = 'https://fourhoi.com/{}/cover-n.jpg'.format(code)
+            seconds = values.get('duration')
+            duration_text = ''
+            try:
+                seconds = int(seconds)
+                if seconds > 0:
+                    duration_text = '{}:{:02d}:{:02d}'.format(seconds // 3600, (seconds // 60) % 60, seconds % 60)
+            except (ValueError, TypeError):
+                pass
+            labels = [code.upper()]
+            if values.get('has_chinese_subtitle'):
+                labels.append('中文字幕')
+            if duration_text:
+                labels.append(duration_text)
+            cards.append({'vod_id': target,
+                          'vod_name': str(values.get('title_cn') or code.upper()),
+                          'vod_pic': pic,
+                          'vod_remarks': ' · '.join(labels),
+                          'style': {'type': 'rect', 'ratio': 1.78}})
+            if len(cards) >= limit:
+                return cards
+    return cards
+
+
+class PageParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.cards = []
+        self.stack = []
+        self.meta = {}
+        self.title_text = []
+        self.in_h1 = False
+        self.anchor_count = 0
+        self.image_count = 0
+        self.links = []
+        self.next_url = ''
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == 'meta':
+            key = a.get('property') or a.get('name')
+            if key:
+                self.meta[key.lower()] = a.get('content', '')
+        if tag == 'h1':
+            self.in_h1 = True
+        if tag == 'a':
+            self.anchor_count += 1
+            href = a.get('href', '')
+            self.links.append(href)
+            self.stack.append({'href': href, 'alt': a.get('alt', ''),
+                               'img': None, 'text': []})
+        elif tag == 'img':
+            self.image_count += 1
+            if self.stack:
+                self.stack[-1]['img'] = a
+        elif tag == 'link' and 'next' in a.get('rel', '').lower():
+            self.next_url = a.get('href', '')
+
+    def handle_data(self, data):
+        if self.in_h1:
+            self.title_text.append(data)
+        if self.stack:
+            self.stack[-1]['text'].append(data)
+
+    def handle_endtag(self, tag):
+        if tag == 'h1':
+            self.in_h1 = False
+        if tag == 'a' and self.stack:
+            self.cards.append(self.stack.pop())
+
+
+
+
+def parse_detail_directors(source):
+    """Extract real director links from detail HTML; never invent a director."""
+    result, seen = [], set()
+    anchor = (r'<a\b[^>]*href\s*=\s*(["\'])([^"\']+)\1[^>]*>'
+              r'(.*?)</a\s*>')
+    for match in re.finditer(anchor, source, re.I | re.S):
+        url = absolute(html.unescape(match.group(2)))
+        path = urlsplit(url).path.rstrip('/')
+        if not re.fullmatch(r'(?:/dm\d+)?/cn/(?:directors|director)/[^/]+', path, re.I):
+            continue
+        if url in seen:
+            continue
+        name = re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', match.group(3)))).strip()
+        if name:
+            result.append((name, url))
+            seen.add(url)
+    return result
+
+
+def parse_detail_entities(source):
+    """Read actual linked metadata from the video information block."""
+    types = ('actresses', 'genres', 'series', 'makers', 'labels', 'directors', 'director')
+    result = {key: [] for key in types}
+    seen = {key: set() for key in types}
+    # The video metadata uses text-secondary rows with one metadata label.
+    for row in re.finditer(r'<div\b[^>]*class=["\'][^"\']*text-secondary[^"\']*["\'][^>]*>(.*?)</div\s*>', source, re.I | re.S):
+        content = row.group(1)
+        if not re.search(r'<span[^>]*>\s*(?:女优|類型|类型|系列|发行商|發行商|标籤|標籤|导演|導演)\s*:', content, re.I):
+            continue
+        for match in re.finditer(r'<a\b[^>]*href\s*=\s*(["\'])(.*?)\1[^>]*>(.*?)</a\s*>', content, re.I | re.S):
+            url = absolute(html.unescape(match.group(2)))
+            path = urlsplit(url).path.rstrip('/')
+            found = re.fullmatch(r'(?:/dm\d+)?/cn/(actresses|genres|series|makers|labels|directors|director)/[^/]+', path, re.I)
+            if not found:
+                continue
+            kind = found.group(1).lower()
+            if url in seen[kind]:
+                continue
+            name = re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', match.group(3)))).strip()
+            if name:
+                seen[kind].add(url)
+                result[kind].append((name, url))
+    return result
+
+def parse_detail_actresses(source):
+    """Read only actual actress anchors from the video metadata, not navigation."""
+    result, seen = [], set()
+    pattern = (r'<a\b[^>]*href\s*=\s*([\"\'])([^\"\']+)\1[^>]*>'
+               r'(.*?)</a\s*>')
+    for match in re.finditer(pattern, source, re.I | re.S):
+        url = absolute(match.group(2))
+        path = urlsplit(url).path.rstrip('/')
+        if not re.fullmatch(r'(?:/dm\d+)?/cn/actresses/[^/]+', path, re.I):
+            continue
+        if path.lower().endswith('/ranking') or url in seen:
+            continue
+        name = re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]+>', ' ', match.group(3)))).strip()
+        if not name:
+            name = unquote(path.split('/')[-1]).replace('-', ' ')
+        if name:
+            seen.add(url)
+            result.append((name, url))
+    return result
+
+
+def parse_videos(source):
+    parser = PageParser()
+    parser.feed(source)
+    result = []
+    seen = set()
+    for item in parser.cards:
+        url = absolute(item['href'])
+        if not valid_video(url) or url in seen:
+            continue
+        image = item['img'] or {}
+        if not image and not item['alt']:
+            continue
+        pic = (image.get('data-src') or image.get('data-original') or
+               image.get('data-lazy-src') or image.get('src') or '')
+        if pic.startswith('data:'):
+            pic = ''
+        code = item['alt'] or urlparse(url).path.rstrip('/').split('/')[-1]
+        name = (image.get('alt') or ' '.join(item['text']).strip() or code)
+        seen.add(url)
+        result.append({'vod_id': url, 'vod_name': name,
+                       'vod_pic': absolute(pic) if pic else '',
+                       'vod_remarks': code.upper(),
+                       'style': {'type': 'rect', 'ratio': 1.78}})
+    return result, parser
+
+
+def unpack_player(source):
+    """Decode the Dean Edwards P.A.C.K.E.R. form used by MissAV.
+
+    This is string substitution only: it never executes website JavaScript.
+    """
+    blocks = []
+    packed = re.compile(
+        r"eval\(function\(p,a,c,k,e,d\)\{.*?\}\("
+        r"'((?:\\.|[^'\\])*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"
+        r"'((?:\\.|[^'\\])*)'\.split\('\|'\)",
+        re.S)
+
+    def base_n(number, radix):
+        digits = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        if number == 0:
+            return '0'
+        out = ''
+        while number:
+            out = digits[number % radix] + out
+            number //= radix
+        return out
+
+    for match in packed.finditer(source):
+        payload, radix, count, dictionary = match.groups()
+        radix, count = int(radix), int(count)
+        if not 2 <= radix <= 62 or count > 10000:
+            continue
+        words = dictionary.split('|')
+        # Decode JS string escapes used in the packed payload.
+        payload = payload.replace("\\'", "'").replace('\\\\', '\\')
+        for i in range(count - 1, -1, -1):
+            word = words[i] if i < len(words) else ''
+            if word:
+                payload = re.sub(r'\b' + re.escape(base_n(i, radix)) + r'\b',
+                                 lambda m, value=word: value, payload)
+        blocks.append(payload)
+    return blocks
+
+
+def extract_sources(source):
+    """Decode all independent streams without assuming JS variable names are resolutions.
+
+    Each stream remains selectable even when a CDN playlist cannot be fetched.
+    """
+    found = []
+    seen = set()
+    scripts = unpack_player(source)
+    # Unpacked player variables and ordinary uncompressed player scripts.
+    for script in scripts + [source]:
+        for name, raw in re.findall(
+                r"\b(source(?:[0-9]+)?|playlist)\s*=\s*['\"]([^'\"]+)['\"]",
+                script, re.I):
+            url = html.unescape(raw.replace('\\/', '/'))
+            if re.match(r'^https?://', url, re.I) and re.search(
+                    r'\.(?:m3u8|mp4)(?:[?#]|$)', url, re.I):
+                if url not in seen:
+                    found.append((name.lower(), url))
+                    seen.add(url)
+    result = found
+    if not result:
+        fallback = extract_media(source)
+        if fallback:
+            result.append(('正片', fallback))
+    return result
+
+
+def stream_quality_hint(url):
+    """Use an explicit media path as a quality hint, never source variable digits."""
+    path = unquote(urlparse(url).path).lower()
+    match = re.search(r'(?:^|[/_.-])(2160|1440|1080|720|480|360)p(?:[/_.-]|$)', path)
+    if match:
+        return match.group(1) + 'P'
+    return ''
+
+
+def quality_rank(label):
+    match = re.search(r'(\d{3,4})P', label, re.I)
+    return int(match.group(1)) if match else 0
+
+
+def extract_media(source):
+    # Only direct media URLs; do not treat short preview.mp4 as the feature video.
+    patterns = [
+        r'<source\b[^>]*\bsrc=["\']([^"\']+)["\']',
+        r'<video\b[^>]*\bsrc=["\']([^"\']+)["\']',
+        r'(?:file|video_url|videoUrl|hlsUrl)\s*[:=]\s*["\']([^"\']+)["\']',
+        r'["\'](https?:\\?/\\?/[^"\'\s<>]+\.(?:m3u8|mp4)(?:\?[^"\'\s<>]*)?)["\']',
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, source, re.I):
+            candidate = html.unescape(match.group(1)).replace('\\/', '/')
+            if '/preview.mp4' in candidate.lower():
+                continue
+            if re.search(r'\.(?:m3u8|mp4)(?:[?#]|$)', candidate, re.I):
+                return absolute(candidate)
+    return ''
+
+
+VERSION_SUFFIXES = ('-uncensored-leak-chinese-subtitle',
+                    '-chinese-subtitle-uncensored-leak',
+                    '-uncensored-leak', '-chinese-subtitle')
+
+
+def version_info(url):
+    """Identify video slugs without requiring a particular studio code format."""
+    full_url = absolute(url)
+    if not valid_video(full_url):
+        return '', ''
+    slug = unquote(urlsplit(full_url).path.rstrip('/').rsplit('/', 1)[-1]).lower()
+    suffix = next((s for s in VERSION_SUFFIXES if slug.endswith(s)), '')
+    code = slug[:-len(suffix)] if suffix else slug
+    if not code or not re.search(r'\d', code):
+        return '', ''
+    if 'uncensored-leak' in suffix and 'chinese-subtitle' in suffix:
+        label = '无码中文字幕'
+    elif 'uncensored-leak' in suffix:
+        label = '无码流出'
+    elif 'chinese-subtitle' in suffix:
+        label = '中文字幕'
+    else:
+        label = '普通版'
+    return code, label
+
+
+def candidate_versions(url):
+    """Probe same-code variants only; never manufacture them in the UI."""
+    parsed = urlparse(url)
+    code, _ = version_info(url)
+    if not code:
+        return [url]
+    base = parsed.path.rsplit('/', 1)[0]
+    paths = [base + '/' + code + suffix for suffix in
+             ('', '-chinese-subtitle', '-uncensored-leak',
+              '-uncensored-leak-chinese-subtitle',
+              '-chinese-subtitle-uncensored-leak')]
+    urls = [url] + [parsed._replace(path=path, query='', fragment='').geturl()
+                    for path in paths]
+    return list(dict.fromkeys(urls))
+
+
+def parse_master_playlist(content, url):
+    """Only label resolutions explicitly advertised by HLS master manifests."""
+    lines = content.replace('\r', '').split('\n')
+    variants = []
+    for i, line in enumerate(lines):
+        if not line.startswith('#EXT-X-STREAM-INF:'):
+            continue
+        match = re.search(r'RESOLUTION=(\d+)x(\d+)', line, re.I)
+        if not match:
+            continue
+        for next_line in lines[i + 1:]:
+            next_line = next_line.strip()
+            if not next_line or next_line.startswith('#'):
+                continue
+            height = int(match.group(2))
+            variants.append((str(height) + 'P', urljoin(url, next_line)))
+            break
+    return list(dict.fromkeys(variants))
+
+
+def encode_play(code, media):
+    return 'missavurl:' + quote(str(code or ''), safe='') + '|' + quote(media, safe='')
+
+
+def decode_play(value):
+    raw = value[len('missavurl:'):]
+    if '|' in raw:
+        code, media = raw.split('|', 1)
+        return unquote(code), unquote(media)
+    return '', unquote(raw)
+
+
+def subtitle_code(url):
+    code, _ = version_info(url)
+    return code.upper()
+
+
+def subtitle_items(data):
+    """Read common Xunlei API response layouts, reject non-subtitle URLs."""
+    if isinstance(data, list): return data
+    if not isinstance(data, dict): return []
+    for key in ('subtitles','subtitle','list','results','data'):
+        value=data.get(key)
+        if isinstance(value,list): return value
+        if isinstance(value,dict):
+            nested=subtitle_items(value)
+            if nested:return nested
+    return []
 
 
 class Spider(BaseSpider):
-
-    def init(self, extend=""):
-        pass
+    def init(self, extend=''):
+        self.last = '未请求'
+        self.last_url = ''
+        self.cookie = ''
+        self.last_preview = ''
+        self.last_title = ''
+        if isinstance(extend, dict):
+            self.cookie = str(extend.get('cookie', '') or '')
+        elif isinstance(extend, str) and extend.strip().startswith('{'):
+            try:
+                import json
+                self.cookie = str(json.loads(extend).get('cookie', '') or '')
+            except Exception:
+                pass
 
     def getName(self):
-        return "MissAV 人机验证"
+        return 'MissAV Python'
 
     def isVideoFormat(self, url):
-        return False
+        return bool(re.search(r'\.(m3u8|mp4)(?:[?#]|$)', str(url), re.I))
 
     def manualVideoCheck(self):
         return False
 
-    def homeContent(self, filter):
-        return {
-            "class": [
-                {
-                    "type_id": "verify",
-                    "type_name": "验证与诊断"
-                }
-            ]
+    def _request(self, path):
+        url = absolute(path)
+        self.last_url = url
+        try:
+            ua = self.net.getUserAgent() or UA
+        except Exception:
+            ua = UA
+        headers = {
+            'User-Agent': ua,
+            'Referer': HOST + '/',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,*/*',
         }
+        try:
+            response = self.net.req(url, {
+                'method': 'GET', 'timeout': 20000,
+                'cookie': True, 'headers': headers
+            })
+            if isinstance(response, str):
+                response = json.loads(response)
+            if not isinstance(response, dict):
+                raise TypeError('net.req 返回类型: ' + type(response).__name__)
+            status = int(response.get('code', response.get('status', 0)) or 0)
+            content = response.get('content', '') or ''
+            if isinstance(content, bytes):
+                content = content.decode('utf-8', errors='replace')
+            else:
+                content = str(content)
+        except Exception as error:
+            self.last = '请求异常: ' + str(error)
+            return 0, '', False
+
+        # Only a challenge signature in the returned page can confirm a
+        # 200-response challenge. A 403 alone does not prove Cloudflare.
+        signature = bool(re.search(
+            r'<title[^>]*>\s*Just a moment\s*\.\.\.|'
+            r'<form[^>]+(?:challenge-form|id=[\"\']challenge-form)|'
+            r'<div[^>]+id=[\"\'](?:cf-challenge-running|challenge-stage)',
+            content, re.I))
+        challenge = status in (403, 429, 503)
+        if status == 200 and signature:
+            try:
+                cards, _ = parse_videos(content)
+                challenge = not bool(cards)
+            except Exception:
+                challenge = True
+        title_match = re.search(r'<title[^>]*>([\s\S]*?)</title>', content, re.I)
+        self.last_title = (
+            html.unescape(re.sub(r'<[^>]+>', '', title_match.group(1))).strip()[:100]
+            if title_match else '(无 title)'
+        )
+        self.last_preview = re.sub(
+            r'\s+', ' ', re.sub(r'<[^>]+>', ' ', content[:3000])
+        ).strip()[:180]
+        self.last = 'HTTP {} | 长度 {} | 验证页 {} | title={} | {}'.format(
+            status, len(content), '是' if challenge else '否', self.last_title, url)
+        return status, content, challenge
+
+    def _list(self, path, pg='1'):
+        try:
+            page = max(1, int(pg))
+        except Exception:
+            page = 1
+        target = absolute(path)
+        if page > 1:
+            target += ('&' if '?' in target else '?') + 'page=' + str(page)
+        status, source, challenge = self._request(target)
+        if status != 200 or challenge or not source:
+            return {'page': page, 'pagecount': page, 'limit': 20, 'total': page * 20,
+                    'list': []}
+        try:
+            videos, parser = parse_videos(source)
+        except Exception as error:
+            self.last = 'HTML解析异常: ' + str(error)
+            return {'page': page, 'pagecount': page, 'limit': 20, 'total': page * 20,
+                    'list': []}
+        # FongMi will not request the next search page when pagecount <= page.
+        # MissAV search pages can omit a next link, even for nonempty results.
+        # Advertise more pages while results exist; stop on empty or repeated pages.
+        if page > 1 and videos:
+            first_status, first_source, first_challenge = self._request(
+                absolute(path))
+            if first_status == 200 and not first_challenge:
+                first_videos, _ = parse_videos(first_source)
+                if first_videos and [v['vod_id'] for v in first_videos[:8]] == [
+                        v['vod_id'] for v in videos[:8]]:
+                    videos = []
+        count = len(videos)
+        return {'page': page, 'pagecount': page + 1 if count else page,
+                'limit': count or 20,
+                'total': (page + 1) * count if count else page * 20,
+                'list': videos}
+
+    def homeContent(self, filter):
+        # Reuse the exact same native filter schema for all top-level categories.
+        # The client controls whether filter UI is exposed inside folder navigation.
+        return {'class': CATEGORIES,
+                'filters': {item['type_id']: category_filter_config()
+                            for item in CATEGORIES}}
 
     def homeVideoContent(self):
-        return {"list": []}
+        return {'list': []}
+
+    def _recombee_recommendations(self, code, video_url):
+        user_id = str(uuid.uuid4())
+        body = json.dumps(recombee_payload(code, user_id), ensure_ascii=False)
+        url = recombee_signed_url()
+        headers = {'Accept': 'application/json',
+                   'Content-Type': 'application/json',
+                   'Origin': HOST, 'Referer': video_url,
+                   'User-Agent': UA}
+        errors = []
+        # Try the FongMi networking bridge first; on some builds POST data is
+        # not forwarded as expected, so fall back to a regular Python request.
+        for transport in ('fongmi', 'urllib'):
+            try:
+                if transport == 'fongmi':
+                    response = self.net.req(url, {
+                        'method': 'POST', 'timeout': 20000,
+                        'headers': headers, 'data': body,
+                    })
+                    if isinstance(response, str):
+                        response = json.loads(response)
+                    if not isinstance(response, dict):
+                        raise ValueError('net.req 返回非字典数据')
+                    status = int(response.get('code', response.get('status', 0)) or 0)
+                    raw = response.get('content', '')
+                else:
+                    req = urllib.request.Request(url, data=body.encode('utf-8'),
+                                                 headers=headers, method='POST')
+                    with urllib.request.urlopen(req, timeout=18) as res:
+                        status = res.status
+                        raw = res.read().decode('utf-8', errors='replace')
+                if status != 200:
+                    raise ValueError('HTTP {}: {}'.format(status, str(raw)[:160]))
+                payload = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+                cards = parse_recombee_results(payload, code)
+                if cards:
+                    return cards, ''
+                # Report actual API codes when recommendations are empty.
+                if isinstance(payload, list):
+                    codes = [str(item.get('code')) for item in payload if isinstance(item, dict)]
+                    raise ValueError('接口无推荐数据，批次状态 {}'.format(','.join(codes)))
+                raise ValueError('接口返回无推荐数据')
+            except Exception as error:
+                errors.append('{}: {}'.format(transport, str(error)))
+        return [], 'Recombee 请求失败：' + '；'.join(errors)
 
     def categoryContent(self, tid, pg, filter, extend):
-        cookie = ""
-        error = ""
-
-        try:
-            cookie = self.net.getCookie(HOST) or ""
-        except Exception as e:
-            error = str(e)
-
-        has_clearance = "cf_clearance=" in cookie
-
-        if has_clearance:
-            status = "已检测到 cf_clearance"
-        else:
-            status = "未检测到 cf_clearance"
-
-        items = [
-            {
-                "vod_id": "verify",
-                "vod_name": "打开 MissAV 人机验证",
-                "vod_remarks": "点击打开 WebView",
-                "action": "verify"
-            },
-            {
-                "vod_id": "check",
-                "vod_name": "检查 Cookie 状态",
-                "vod_remarks": status,
-                "action": "check"
-            }
-        ]
-
-        if error:
-            items.append({
-                "vod_id": "error",
-                "vod_name": "Cookie 接口异常",
-                "vod_remarks": error[:80],
-                "action": "check"
-            })
-
-        return {
-            "list": items,
-            "page": 1,
-            "pagecount": 1,
-            "limit": len(items),
-            "total": len(items)
-        }
-
-    def action(self, action, value=""):
-        if action == "verify":
-            return {
-                "web": {
-                    "url": HOST,
-                    "mode": "browser",
-                    "cookie": [
-                        {
-                            "keys": ["cf_clearance"]
-                        }
-                    ]
-                }
-            }
-
-        if action == "check":
+        if str(tid).startswith('missaverror:'):
+            return {'list': [], 'page': 1, 'pagecount': 1}
+        if str(tid).startswith(RECOMMEND_PREFIX):
+            url = unquote(str(tid)[len(RECOMMEND_PREFIX):])
+            if not valid_video(url):
+                return {'list': [], 'page': 1, 'pagecount': 1, 'limit': 40, 'total': 0}
             try:
-                cookie = self.net.getCookie(HOST) or ""
+                page = max(1, int(pg))
+            except (TypeError, ValueError):
+                page = 1
+            if page > 1:
+                return {'list': [], 'page': page, 'pagecount': page, 'limit': 40, 'total': 0}
+            code, _ = version_info(url)
+            if not code:
+                return {'list': [], 'page': 1, 'pagecount': 1,
+                        'limit': 40, 'total': 0, 'msg': '无法从视频地址识别番号'}
+            cards, error = self._recombee_recommendations(code, url)
+            if not cards and error:
+                cards = [{'vod_id': 'missaverror:' + quote(error[:300], safe=''),
+                          'vod_name': '相关推荐获取失败',
+                          'vod_remarks': error[:180], 'vod_pic': ''}]
+            return {'list': cards, 'page': 1, 'pagecount': 1,
+                    'limit': 40, 'total': len(cards),
+                    'msg': error if error else ''}
+        # Folder cards are routed to categoryContent using their vod_id.
+        # Use the real entity URL as the category id to retain site pagination.
+        entity_path = urlsplit(absolute(tid)).path.rstrip('/')
+        if re.match(r'^(?:/dm\d+)?/cn/(?:actresses|genres|series|makers|labels|directors|director)/[^/]+$', entity_path, re.I) and not entity_path.endswith('/ranking'):
+            selected = extend if isinstance(extend, dict) else {}
+            sort = str(selected.get('sort', '') or '')
+            work_filter = str(selected.get('work_filter', '') or '')
+            result = self._list(append_options(tid, sort, [work_filter]), pg)
+            # Hint only: clients that ignore filters in category responses
+            # cannot be forced to show a native filter bar by a Spider.
+            return result
+        kind = special_kind(tid)
+        if kind:
+            try:
+                page = max(1, int(pg))
+            except Exception:
+                page = 1
+            url = absolute(tid)
+            if page > 1:
+                url += ('&' if '?' in url else '?') + 'page=' + str(page)
+            status, body, blocked = self._request(url)
+            items = parse_directory(body, kind) if status == 200 and not blocked else []
+            # Ranking page is a single list; other directories have site pagination.
+            more = bool(items) and urlsplit(absolute(tid)).path.rstrip('/') != '/cn/actresses/ranking'
+            return {'list': items, 'page': page,
+                    'pagecount': page + 1 if more else page,
+                    'limit': len(items) or 20,
+                    'total': (page + 1) * len(items) if more else len(items)}
+        selected = extend if isinstance(extend, dict) else {}
+        sort = str(selected.get('sort', '') or '')
+        filters = [str(selected.get('work_filter', '') or '')]
+        target = append_options(tid or '/cn', sort, filters)
+        return self._list(target, pg)
 
-                if "cf_clearance=" in cookie:
-                    msg = "已检测到 cf_clearance"
-                else:
-                    msg = "未检测到 cf_clearance"
+    def searchContent(self, key, quick, pg='1'):
+        keyword, sort, filters = parse_search_expression(key)
+        if not keyword:
+            return {'list': [], 'page': 1, 'pagecount': 1, 'limit': 20, 'total': 0}
+        target = append_options('/cn/search/' + quote(keyword, safe=''), sort, filters)
+        return self._search_aggregated(target, pg)
 
-                return {"msg": msg}
+    def _search_aggregated(self, target, pg='1'):
+        """Fetch up to three website pages per client page; return videos only."""
+        try:
+            client_page = max(1, int(pg))
+        except (TypeError, ValueError):
+            client_page = 1
+        batch_size = 3
+        first_site_page = (client_page - 1) * batch_size + 1
+        items, seen = [], set()
+        actresses, seen_actresses = [], set()
+        completed_batch = False
+        for site_page in range(first_site_page, first_site_page + batch_size):
+            url = absolute(target)
+            if site_page > 1:
+                url += ('&' if '?' in url else '?') + 'page=' + str(site_page)
+            status, body, blocked = self._request(url)
+            if status != 200 or blocked or not body:
+                break
+            try:
+                page_items, _ = parse_videos(body)
+                page_actresses = parse_search_actresses(body)
+            except Exception:
+                break
+            for actress in page_actresses:
+                if actress['vod_id'] not in seen_actresses:
+                    seen_actresses.add(actress['vod_id'])
+                    actresses.append(actress)
+            fresh = 0
+            for item in page_items:
+                if item['vod_id'] not in seen:
+                    seen.add(item['vod_id'])
+                    items.append(item)
+                    fresh += 1
+            if not page_items or fresh == 0:
+                break
+            if site_page == first_site_page + batch_size - 1:
+                completed_batch = True
+        # Put clickable actress portraits ahead of landscape video cards.
+        # Keep search-page pagination driven by videos, not by repeated portraits.
+        results = actresses + items
+        n = len(results)
+        return {'list': results, 'page': client_page,
+                'pagecount': client_page + 1 if items and completed_batch else client_page,
+                'limit': n or 20,
+                'total': (client_page + 1) * n if n else client_page * 20}
 
-            except Exception as e:
-                return {"msg": "读取失败：" + str(e)}
-
-        return {"msg": "未知操作"}
-
-    def searchContent(self, key, quick, pg="1"):
-        return {"list": []}
+    def _qualities(self, stream_url):
+        """Inspect HLS master manifests first; retain the original stream on failure."""
+        hinted = stream_quality_hint(stream_url)
+        if not re.search(r'\.m3u8(?:[?#]|$)', stream_url, re.I):
+            return [(hinted or '原始画质', stream_url)]
+        status, manifest, challenge = self._request(stream_url)
+        if status == 200 and not challenge and '#EXTM3U' in manifest[:200]:
+            choices = parse_master_playlist(manifest, stream_url)
+            if choices:
+                return sorted(choices, key=lambda item: quality_rank(item[0]), reverse=True)
+        return [(hinted or '自动/原始', stream_url)]
 
     def detailContent(self, ids):
-        return {"list": []}
+        vid = ids[0] if isinstance(ids, (list, tuple)) else str(ids)
+        if str(vid).startswith('missavdir:'):
+            directory_url = unquote(str(vid)[len('missavdir:'):])
+            if not directory_url.startswith(HOST + '/'):
+                return {'list': []}
+            status, body, blocked = self._request(directory_url)
+            videos, _ = parse_videos(body) if status == 200 and not blocked else ([], None)
+            title = unquote(urlsplit(directory_url).path.rstrip('/').split('/')[-1])
+            # FongMi treats directory cards as video details. Present their first
+            # page as a playable episode list, without changing the client.
+            entries = ['{}$missavpage:{}'.format(
+                re.sub(r'[$#]', ' ', v['vod_name']), quote(v['vod_id'], safe=''))
+                for v in videos]
+            return {'list': [{'vod_id': vid, 'vod_name': title,
+                              'vod_content': '该目录第一页的影片；选择条目直接播放。',
+                              'vod_play_from': '相关影片' if entries else '',
+                              'vod_play_url': '#'.join(entries)}]}
+        status, source, challenge = self._request(vid)
+        if status != 200 or challenge:
+            return {'list': [{'vod_id': vid, 'vod_name': '详情请求失败',
+                              'vod_content': self.last}]}
+        parser = PageParser()
+        parser.feed(source)
+        name = (' '.join(parser.title_text).strip() or
+                parser.meta.get('og:title') or vid.rsplit('/', 1)[-1])
+        code, _ = version_info(vid)
+        entities = parse_detail_entities(source)
+        actresses = entities['actresses'] or parse_detail_actresses(source)
+        directors = entities['directors'] + entities['director'] or parse_detail_directors(source)
+        director_links = []
+        for director_name, director_url in directors:
+            target = {'id': director_url, 'name': director_name, 'type_flag': 1}
+            try:
+                director_links.append(self.link(director_name, target))
+            except Exception:
+                director_links.append(director_name)
+        actress_links = []
+        for actress_name, actress_url in actresses:
+            target = {'id': actress_url, 'name': actress_name, 'type_flag': 1}
+            try:
+                actress_links.append(self.link(actress_name, target))
+            except Exception:
+                actress_links.append(actress_name)
+        def clickable_entities(items):
+            links = []
+            for display_name, entity_url in items:
+                # target.filter must be an object keyed by the target category ID;
+                # each value is the filter-row array used by Result.filters.
+                target = {
+                    'id': entity_url,
+                    'name': display_name,
+                    'type_flag': 1,
+                    'filter': {str(entity_url): category_filter_config()},
+                }
+                try:
+                    links.append(self.link(display_name, target))
+                except Exception:
+                    links.append(display_name)
+            return '、'.join(links)
+
+        extra_rows = []
+        for label, kind in (('类型', 'genres'), ('系列', 'series'),
+                            ('发行商', 'makers'), ('标签', 'labels')):
+            values = clickable_entities(entities[kind])
+            if values:
+                extra_rows.append(label + '：' + values)
+        # Separate category-style recommendation entry, not a playback line.
+        recommend_target = {'id': RECOMMEND_PREFIX + quote(absolute(vid), safe=''),
+                            'name': '相关推荐', 'type_flag': 1}
+        try:
+            recommend_link = self.link('相关推荐', recommend_target)
+        except Exception:
+            recommend_link = '相关推荐'
+        # Extract the actual release date from the detail metadata row.
+        release_date = ''
+        date_row = re.search(
+            r'(?:发行日期|發行日期)\s*[:：]\s*(?:</span>\s*)?(.{0,180}?)</div\s*>',
+            source, re.I | re.S)
+        if date_row:
+            date_text = re.sub(r'<[^>]+>', ' ', date_row.group(1))
+            date_match = re.search(r'\b(20\d{2}|19\d{2})[-/.年]\s*(\d{1,2})[-/.月]\s*(\d{1,2})', date_text)
+            if date_match:
+                release_date = '{}-{:02d}-{:02d}'.format(
+                    date_match.group(1), int(date_match.group(2)), int(date_match.group(3)))
+        # Discover real same-code variants via the verified /cn/search/<code> page.
+        # Do not guess /dmNN/ paths: they can differ between versions.
+        candidates = [vid]
+        # Variant discovery is optional; a valid current page must play even
+        # when search is unavailable or returns no results.
+        if code:
+            search_status, search_html, search_blocked = self._request(
+                '/cn/search/' + quote(code, safe=''))
+            if search_status == 200 and not search_blocked:
+                search_items, _ = parse_videos(search_html)
+                for item in search_items:
+                    url = item['vod_id']
+                    other_code, _ = version_info(url)
+                    if other_code == code and url not in candidates:
+                        candidates.append(url)
+        # Playback depends on real page media, never on successful code recognition.
+        # Only optional same-code version discovery uses the parsed code.
+        groups = []
+        seen_versions = set()
+        for page in candidates:
+            current = page == vid
+            if current:
+                body = source
+            else:
+                status, body, blocked = self._request(page)
+                if status != 200 or blocked:
+                    continue
+
+            # Extract streams BEFORE checking identifiers or version metadata.
+            streams = extract_sources(body)
+            if not streams:
+                continue
+
+            found_code, label = version_info(page)
+            if not current:
+                if not found_code or found_code != code:
+                    continue
+                # Validate optional variant URLs, not the original requested page.
+                canonical = re.search(r"<link[^>]+rel=[\"\']canonical[\"\'][^>]+href=[\"\']([^\"\']+)", body, re.I)
+                ogurl = re.search(r"<meta[^>]+property=[\"\']og:url[\"\'][^>]+content=[\"\']([^\"\']+)", body, re.I)
+                actual = canonical or ogurl
+                if actual:
+                    actual_code, actual_label = version_info(html.unescape(actual.group(1)))
+                    if actual_code != found_code or actual_label != label:
+                        continue
+            if not label:
+                label = '普通版'
+            if label in seen_versions:
+                continue
+
+            entries = []
+            seen_urls = set()
+            for stream_label, stream_url in streams:
+                for quality, media_url in self._qualities(stream_url):
+                    if media_url in seen_urls:
+                        continue
+                    seen_urls.add(media_url)
+                    entries.append((quality, stream_label, media_url))
+            entries.sort(key=lambda item: quality_rank(item[0]), reverse=True)
+            # The code is optional: an empty value still produces a valid play URL.
+            entries = ['{} · {}${}'.format(
+                quality, stream_label, encode_play(found_code or '', media_url))
+                for quality, stream_label, media_url in entries]
+            if entries:
+                groups.append((label, '#'.join(entries)))
+                seen_versions.add(label)
+        # Keep only requested metadata, one line per field, no blank lines.
+        metadata_rows = [
+            '发行日期：' + release_date if release_date else '',
+            '番号：' + code.upper() if code else '',
+            '标题：' + name if name else '',
+            '女优：' + '、'.join(actress_links) if actress_links else '',
+        ]
+        metadata_rows.extend(extra_rows)
+        if director_links:
+            metadata_rows.append('导演：' + '、'.join(director_links))
+        # Experiment: put recommendation in the native remarks area, not synopsis.
+        return {'list': [{
+            'vod_id': vid,
+            'vod_name': name,
+            'vod_pic': absolute(parser.meta.get('og:image')) if parser.meta.get('og:image') else '',
+            # FongMi's built-in field captions cannot be renamed by a Spider.
+            # Test: move clickable metadata to synopsis, suppress actor field.
+            'vod_actor': '',
+            'vod_director': '',
+            'vod_area': '',
+            'vod_year': '',
+            'vod_pubdate': '',
+            'vod_content': '\n'.join(['相关推荐：' + recommend_link] + list(filter(None, metadata_rows))),
+            'vod_remarks': '',
+            'vod_play_from': '$$$'.join(label for label, _ in groups),
+            'vod_play_url': '$$$'.join(items for _, items in groups)
+        }]}
+
+    def search_subtitles(self, code, video_duration=0):
+        """Xunlei API: {code:0,data:[{url,name,ext,duration,languages}]}.
+
+        duration is treated as milliseconds, consistent with the sample response.
+        Empty languages are not interpreted as Chinese.
+        """
+        if not code:
+            return []
+        api = ('https://api-shoulei-ssl.xunlei.com/oracle/subtitle?name='
+               + quote(code.upper(), safe=''))
+        status, body, blocked = self._request(api)
+        if status != 200 or not body or blocked:
+            return []
+        try:
+            payload = json.loads(body)
+            if isinstance(payload, dict) and payload.get('code') not in (None, 0):
+                return []
+            items = subtitle_items(payload)
+        except (ValueError, TypeError):
+            return []
+        seen = set()
+        candidates = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get('url') or '').strip()
+            if not url.startswith(('http://', 'https://')) or url in seen:
+                continue
+            ext = str(item.get('ext') or urlsplit(url).path.rsplit('.', 1)[-1]).lower().lstrip('.')
+            if ext not in ('srt', 'ass', 'ssa', 'vtt'):
+                continue
+            seen.add(url)
+            name = str(item.get('name') or code.upper() + '.' + ext)
+            normalized = name.lower()
+            if re.search(r'zh[-_]?cn|chs|简体|简中', normalized):
+                score, lang = 3, 'zh-CN'
+            elif re.search(r'zh|chi|中文|中字', normalized):
+                score, lang = 2, 'zh-CN'
+            else:
+                score, lang = 0, 'und'
+            try:
+                duration = max(0, float(item.get('duration') or 0)) / 1000
+            except (ValueError, TypeError):
+                duration = 0
+            delta = abs(duration - video_duration) if duration and video_duration else float('inf')
+            candidates.append((score, delta, duration, {
+                'url': url, 'name': name, 'lang': lang,
+                'format': {'srt': 'application/x-subrip',
+                           'ass': 'text/x-ssa', 'ssa': 'text/x-ssa',
+                           'vtt': 'text/vtt'}[ext], 'flag': 0
+            }))
+        candidates.sort(key=lambda item: (-item[0], item[1], -item[2]))
+        result = [item[3] for item in candidates[:15]]
+        if result:
+            result[0]['flag'] = 1
+        self.subtitle_diagnostic = '{}：找到 {} 条字幕'.format(code.upper(), len(result))
+        return result
 
     def playerContent(self, flag, id, vipFlags):
-        return {"parse": 0, "url": ""}
+        target = str(id or '')
+        code = ''
+        if target.startswith('missavpage:'):
+            page_url = unquote(target[len('missavpage:'):])
+            if not page_url.startswith(HOST + '/'):
+                return {'parse': 0, 'url': '', 'msg': '无效影片地址'}
+            status, body, blocked = self._request(page_url)
+            streams = extract_sources(body) if status == 200 and not blocked else []
+            if not streams:
+                return {'parse': 0, 'url': '', 'msg': '影片播放地址解析失败'}
+            url = streams[0][1]
+            code = subtitle_code(page_url)
+        elif target.startswith('missavurl:'):
+            code, url = decode_play(target)
+        elif self.isVideoFormat(target):
+            url = target
+        else:
+            return {'parse': 0, 'url': '', 'msg': '未知播放地址，请重新进入详情页'}
+        if not re.match(r'^https?://', url, re.I):
+            return {'parse': 0, 'url': '', 'msg': '无效播放地址'}
+        subs = self.search_subtitles(code) if code else []
+        return {'parse': 0, 'url': url,
+                'header': {'User-Agent': UA, 'Referer': HOST + '/'},
+                'subs': subs}
 
     def destroy(self):
         pass
-
