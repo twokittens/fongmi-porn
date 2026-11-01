@@ -59,8 +59,8 @@
   ],
   "sites": [
     {
-      "key": "missav_python_v48",
-      "name": "MissAV",
+      "key": "missav_python_v49",
+      "name": "MissAVtest",
       "type": 3,
       "api": "./missav.py",
       "searchable": 1,
