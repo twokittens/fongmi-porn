@@ -54,7 +54,7 @@ SORT_OPTIONS = [
 ]
 CATEGORY_FILTER_OPTIONS = [
     ('单人作品', 'individual'), ('多人作品', 'multiple'),
-    ('中文字幕', 'chinese-subtitle'), ('无码流出', 'uncensored-leak'),
+    ('中文字幕', 'chinese-subtitle'),
 ]
 SEARCH_FILTER_OPTIONS = [
     ('单人作品', 'individual'), ('日本AV', 'jav'),
@@ -212,20 +212,8 @@ def filter_choices(options):
 
 def category_filter_config():
     return [
-        {'key': 'sort', 'name': '排序', 'init': '',
-         'value': filter_choices(SORT_OPTIONS)},
-        {'key': 'work_filter', 'name': '作品过滤', 'init': '',
-         'value': filter_choices(CATEGORY_FILTER_OPTIONS)},
-    ]
-
-
-def search_filter_config():
-    """Native filter definition exposed experimentally on search results."""
-    return [
-        {'key': 'sort', 'name': '排序', 'init': '',
-         'value': filter_choices(SORT_OPTIONS)},
-        {'key': 'work_filter', 'name': '作品过滤', 'init': '',
-         'value': filter_choices(SEARCH_FILTER_OPTIONS)},
+        {'key': 'sort', 'name': '排序', 'value': filter_choices(SORT_OPTIONS)},
+        {'key': 'work_filter', 'name': '作品过滤', 'value': filter_choices(CATEGORY_FILTER_OPTIONS)},
     ]
 
 
@@ -702,6 +690,48 @@ def version_info(url):
     return code, label
 
 
+def parse_version_switch_links(source, current_url):
+    """Read actual version-switch menu links, never synthesize variant URLs."""
+    class SwitchParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.anchor = None
+            self.links = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == 'a':
+                data = dict(attrs)
+                self.anchor = {'href': data.get('href', ''),
+                               'role': data.get('role', ''), 'text': []}
+
+        def handle_data(self, data):
+            if self.anchor is not None:
+                self.anchor['text'].append(data)
+
+        def handle_endtag(self, tag):
+            if tag == 'a' and self.anchor is not None:
+                item = self.anchor
+                self.anchor = None
+                label = re.sub(r'\s+', '', ''.join(item['text']))
+                if ('切换' in label and any(word in label for word in
+                        ('无码', '有码', '字幕', '普通', '版本'))) or (
+                        item['role'] == 'menuitem' and '切换' in label):
+                    self.links.append(item['href'])
+
+    parser = SwitchParser()
+    parser.feed(source)
+    current = absolute(current_url).split('#', 1)[0]
+    code, _ = version_info(current)
+    found = []
+    for href in parser.links:
+        url = absolute(href).split('#', 1)[0]
+        other_code, _ = version_info(url)
+        if (url != current and valid_video(url) and url not in found
+                and (not code or other_code == code)):
+            found.append(url)
+    return found
+
+
 def candidate_versions(url):
     """Probe same-code variants only; never manufacture them in the UI."""
     parsed = urlparse(url)
@@ -1005,14 +1035,7 @@ class Spider(BaseSpider):
         if not keyword:
             return {'list': [], 'page': 1, 'pagecount': 1, 'limit': 20, 'total': 0}
         target = append_options('/cn/search/' + quote(keyword, safe=''), sort, filters)
-        result = self._search_aggregated(target, pg)
-        # Experimental: current Spider docs define Result.filters globally,
-        # but do not guarantee that the native search page renders or handles
-        # them. Key by the actual search URL so builds that support it can bind
-        # the filter definition to this result context. Search filtering itself
-        # remains the existing keyword expression logic above.
-        result['filters'] = {target: search_filter_config()}
-        return result
+        return self._search_aggregated(target, pg)
 
     def _search_aggregated(self, target, pg='1'):
         """Fetch up to three website pages per client page; return videos only."""
@@ -1119,10 +1142,7 @@ class Spider(BaseSpider):
         def clickable_entities(items):
             links = []
             for display_name, entity_url in items:
-                # FongMi target.filter is the native way to attach filters to
-                # a folder opened from a detail-page metadata link.
-                target = {'id': entity_url, 'name': display_name,
-                          'type_flag': 1, 'filter': category_filter_config()}
+                target = {'id': entity_url, 'name': display_name, 'type_flag': 1}
                 try:
                     links.append(self.link(display_name, target))
                 except Exception:
@@ -1153,12 +1173,12 @@ class Spider(BaseSpider):
             if date_match:
                 release_date = '{}-{:02d}-{:02d}'.format(
                     date_match.group(1), int(date_match.group(2)), int(date_match.group(3)))
-        # Discover real same-code variants via the verified /cn/search/<code> page.
-        # Do not guess /dmNN/ paths: they can differ between versions.
+        # Prefer the site's explicit version-switch links. Search is only a
+        # fallback when the current page does not expose any switch links.
         candidates = [vid]
-        # Variant discovery is optional; a valid current page must play even
-        # when search is unavailable or returns no results.
-        if code:
+        switch_links = parse_version_switch_links(source, vid)
+        candidates.extend(link for link in switch_links if link not in candidates)
+        if not switch_links and code:
             search_status, search_html, search_blocked = self._request(
                 '/cn/search/' + quote(code, safe=''))
             if search_status == 200 and not search_blocked:
