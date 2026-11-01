@@ -339,7 +339,7 @@ def parse_recommendation_cards(source, current_url, limit=40):
                       'style': {'type': 'rect', 'ratio': 1.78}})
         if len(cards) >= limit:
             break
-    return cards
+    return deduplicate_videos(cards)
 
 
 # Public browser token embedded in the supplied MissAV JavaScript bundle.
@@ -563,7 +563,7 @@ def parse_videos(source):
                        'vod_pic': absolute(pic) if pic else '',
                        'vod_remarks': code.upper(),
                        'style': {'type': 'rect', 'ratio': 1.78}})
-    return result, parser
+    return deduplicate_videos(result), parser
 
 
 def unpack_player(source):
@@ -688,6 +688,69 @@ def version_info(url):
     else:
         label = '普通版'
     return code, label
+
+
+def deduplicate_videos(videos):
+    priorities = {'无码流出': 0, '无码中文字幕': 0, '中文字幕': 1, '普通版': 2}
+    result = []
+    positions = {}
+    selected_priorities = []
+    for video in videos:
+        code, label = version_info(video['vod_id'])
+        key = ('code', code) if code else ('url', video['vod_id'])
+        priority = priorities.get(label, 2)
+        if key in positions:
+            index = positions[key]
+            if priority < selected_priorities[index]:
+                result[index] = video
+                selected_priorities[index] = priority
+            continue
+        positions[key] = len(result)
+        selected_priorities.append(priority)
+        result.append(video)
+    return result
+
+
+def parse_version_switch_links(source, current_url):
+    """Read actual version-switch menu links, never synthesize variant URLs."""
+    class SwitchParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.anchor = None
+            self.links = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == 'a':
+                data = dict(attrs)
+                self.anchor = {'href': data.get('href', ''),
+                               'role': data.get('role', ''), 'text': []}
+
+        def handle_data(self, data):
+            if self.anchor is not None:
+                self.anchor['text'].append(data)
+
+        def handle_endtag(self, tag):
+            if tag == 'a' and self.anchor is not None:
+                item = self.anchor
+                self.anchor = None
+                label = re.sub(r'\s+', '', ''.join(item['text']))
+                if ('切换' in label and any(word in label for word in
+                        ('无码', '有码', '字幕', '普通', '版本'))) or (
+                        item['role'] == 'menuitem' and '切换' in label):
+                    self.links.append(item['href'])
+
+    parser = SwitchParser()
+    parser.feed(source)
+    current = absolute(current_url).split('#', 1)[0]
+    code, _ = version_info(current)
+    found = []
+    for href in parser.links:
+        url = absolute(href).split('#', 1)[0]
+        other_code, _ = version_info(url)
+        if (url != current and valid_video(url) and url not in found
+                and (not code or other_code == code)):
+            found.append(url)
+    return found
 
 
 def candidate_versions(url):
@@ -1034,6 +1097,7 @@ class Spider(BaseSpider):
                 completed_batch = True
         # Put clickable actress portraits ahead of landscape video cards.
         # Keep search-page pagination driven by videos, not by repeated portraits.
+        items = deduplicate_videos(items)
         results = actresses + items
         n = len(results)
         return {'list': results, 'page': client_page,
@@ -1100,12 +1164,7 @@ class Spider(BaseSpider):
         def clickable_entities(items):
             links = []
             for display_name, entity_url in items:
-                target = {
-                    'id': entity_url,
-                    'name': display_name,
-                    'type_flag': 1,
-                    'filter': category_filter_config(),
-                }
+                target = {'id': entity_url, 'name': display_name, 'type_flag': 1}
                 try:
                     links.append(self.link(display_name, target))
                 except Exception:
@@ -1136,12 +1195,12 @@ class Spider(BaseSpider):
             if date_match:
                 release_date = '{}-{:02d}-{:02d}'.format(
                     date_match.group(1), int(date_match.group(2)), int(date_match.group(3)))
-        # Discover real same-code variants via the verified /cn/search/<code> page.
-        # Do not guess /dmNN/ paths: they can differ between versions.
+        # Prefer the site's explicit version-switch links. Search is only a
+        # fallback when the current page does not expose any switch links.
         candidates = [vid]
-        # Variant discovery is optional; a valid current page must play even
-        # when search is unavailable or returns no results.
-        if code:
+        switch_links = parse_version_switch_links(source, vid)
+        candidates.extend(link for link in switch_links if link not in candidates)
+        if not switch_links and code:
             search_status, search_html, search_blocked = self._request(
                 '/cn/search/' + quote(code, safe=''))
             if search_status == 200 and not search_blocked:
