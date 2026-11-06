@@ -384,11 +384,27 @@ class Spider(BaseSpider):
         }
 
     def _error_card(self, error):
+        message = _clean(error)
+        if "cloudflare" in message.lower():
+            status = re.search(r"HTTP\s+(\d+)", message, re.I)
+            remarks = "HTTP %s；Cookie未被接受或已失效" % (
+                status.group(1) if status else "验证失败"
+            )
+            name = "Cloudflare 拦截"
+        elif "页面已加载但未识别到视频卡片" in message:
+            match = re.search(r"视频链接=(\d+)", message)
+            remarks = "页面结构不匹配；视频链接=%s" % (
+                match.group(1) if match else "未知"
+            )
+            name = "未识别到视频"
+        else:
+            remarks = message[:36] or "请稍后重试"
+            name = "请求失败"
         return {
             "vod_id": "sb-error",
-            "vod_name": "SpankBang 加载失败",
+            "vod_name": name,
             "vod_pic": "",
-            "vod_remarks": _clean(error)[:180],
+            "vod_remarks": remarks,
         }
 
     def _empty_page_card(self, root):
