@@ -123,6 +123,18 @@
       "changeable": 0,
       "hide": 0,
       "ext": {}
+    },
+    {
+      "key": "spankbang_verify",
+      "name": "Spankbang 人机验证",
+      "type": 3,
+      "api": "./spankbang_verify.py",
+      "searchable": 0,
+      "quickSearch": 0,
+      "filterable": 0,
+      "changeable": 0,
+      "hide": 0,
+      "ext": {}
     }
   ]
 }
