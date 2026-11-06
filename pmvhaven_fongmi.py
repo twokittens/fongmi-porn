@@ -927,7 +927,7 @@ class Spider(BaseSpider):
                     self._entity_link(
                         playlist_name,
                         "playlistplay:" + playlist_id + ":" + U.quote(playlist_name, safe=""),
-                        0
+                        1
                     )
                 )
             if playlist_links:
