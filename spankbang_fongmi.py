@@ -188,27 +188,45 @@ class Spider(BaseSpider):
 
         # cookie=True 让 FongMi 网络层复用 WebView 中完成人机验证后保存的 Cookie。
         result = self.net.req(url, {
+            "method": "GET",
             "timeout": 20000,
             "callTimeout": 35000,
             "headers": request_headers,
             "cookie": True,
         })
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except ValueError:
+                raise Exception("HTTP 响应格式异常：网络层返回非 JSON 字符串")
         if not isinstance(result, dict):
             raise Exception("HTTP 请求返回格式异常")
-        code = int(result.get("code", 0) or 0)
+        code = int(result.get("code", result.get("status", 0)) or 0)
         content = result.get("content", "")
         if isinstance(content, bytes):
             content = content.decode("utf-8", "replace")
         if not isinstance(content, str):
             content = str(content)
 
-        if code in (403, 429, 503) or self._is_cloudflare_challenge(content):
+        challenge = self._is_cloudflare_challenge(content)
+        if code in (403, 429, 503) or challenge:
             self._cache.pop(url, None)
-            if self._has_cf_clearance(cookie):
-                raise Exception("SpankBang 仍返回 Cloudflare 验证页（HTTP %s）；当前 cf_clearance 可能已失效或未被目标请求接受" % code)
-            raise Exception("SpankBang 需要先完成人机验证：请运行独立的 spankbang_verify Spider，完成验证后重试（HTTP %s）" % code)
+            title_match = re.search(
+                r"<title[^>]*>(.*?)</title\s*>", content, re.I | re.S)
+            title = _clean(title_match.group(1))[:48] if title_match else "无标题"
+            reason = "检测到验证页" if challenge else "服务器拒绝请求"
+            raise Exception(
+                "%s；HTTP %s；title=%s；长度=%s"
+                % (reason, code, title, len(content))
+            )
         if code < 200 or code >= 400:
-            raise Exception("HTTP %s: %s" % (code, url))
+            title_match = re.search(
+                r"<title[^>]*>(.*?)</title\s*>", content, re.I | re.S)
+            title = _clean(title_match.group(1))[:48] if title_match else "无标题"
+            raise Exception(
+                "HTTP %s；title=%s；长度=%s"
+                % (code, title, len(content))
+            )
 
         self._cache[url] = content
         return content
@@ -385,18 +403,24 @@ class Spider(BaseSpider):
 
     def _error_card(self, error):
         message = _clean(error)
-        if "cloudflare" in message.lower():
+        if "HTTP" in message and ("验证页" in message or "拒绝请求" in message):
             status = re.search(r"HTTP\s+(\d+)", message, re.I)
-            remarks = "HTTP %s；Cookie未被接受或已失效" % (
-                status.group(1) if status else "验证失败"
+            title = re.search(r"title=([^；]+)", message)
+            length = re.search(r"长度=(\d+)", message)
+            name = "验证页" if "验证页" in message else "请求被拒绝"
+            remarks = "HTTP %s；%s；%s字节" % (
+                status.group(1) if status else "?",
+                title.group(1)[:18] if title else "无标题",
+                length.group(1) if length else "?",
             )
-            name = "Cloudflare 拦截"
         elif "页面已加载但未识别到视频卡片" in message:
+            title = re.search(r"标题=([^；]+)", message)
             match = re.search(r"视频链接=(\d+)", message)
-            remarks = "页面结构不匹配；视频链接=%s" % (
-                match.group(1) if match else "未知"
+            remarks = "title=%s；链接=%s" % (
+                title.group(1)[:16] if title else "?",
+                match.group(1) if match else "?",
             )
-            name = "未识别到视频"
+            name = "页面无视频"
         else:
             remarks = message[:36] or "请稍后重试"
             name = "请求失败"
