@@ -124,6 +124,24 @@ class Spider(BaseSpider):
         }
         self._cache = {}
 
+    def _get_cookie(self):
+        try:
+            return self.net.getCookie(HOST) or ""
+        except Exception:
+            return ""
+
+    def _has_clearance(self):
+        return "cf_clearance=" in self._get_cookie()
+
+    def _is_challenge(self, source):
+        text = (source or "").lower()
+        markers = (
+            "cf-chl-", "challenge-platform", "just a moment",
+            "checking your browser", "verify you are human",
+            "attention required! | cloudflare", "enable javascript and cookies",
+        )
+        return any(marker in text for marker in markers)
+
     # ------------------------- network / parsing -------------------------
 
     def _request(self, url):
@@ -132,21 +150,27 @@ class Spider(BaseSpider):
         if cached is not None:
             return cached
 
+        request_headers = dict(self.headers)
+        cookie = self._get_cookie()
+        if cookie:
+            request_headers["Cookie"] = cookie
         result = self.net.req(url, {
             "timeout": 20000,
             "callTimeout": 35000,
-            "headers": dict(self.headers),
+            "headers": request_headers,
         })
         if not isinstance(result, dict):
             raise Exception("HTTP 请求返回格式异常")
         code = int(result.get("code", 0) or 0)
-        if code < 200 or code >= 400:
-            raise Exception("HTTP %s: %s" % (code, url))
         content = result.get("content", "")
         if isinstance(content, bytes):
             content = content.decode("utf-8", "replace")
         if not isinstance(content, str):
             content = str(content)
+        if self._is_challenge(content):
+            raise Exception("检测到 SpankBang Cloudflare 人机验证；请先进入‘验证与诊断’打开 WebView 完成验证，再重新加载")
+        if code < 200 or code >= 400:
+            raise Exception("HTTP %s: %s" % (code, url))
         self._cache[url] = content
         return content
 
@@ -347,6 +371,7 @@ class Spider(BaseSpider):
             {"type_id": "/s/pmv/", "type_name": "PMV 默认", "ratio": 1.78},
             {"type_id": "/s/pmv/?o=new", "type_name": "PMV 最新", "ratio": 1.78},
             {"type_id": "/s/pmv/?o=popular", "type_name": "PMV 最受欢迎", "ratio": 1.78},
+            {"type_id": "verify", "type_name": "验证与诊断", "ratio": 1.78},
         ]
         return {"class": classes}
 
@@ -360,6 +385,18 @@ class Spider(BaseSpider):
     # ------------------------------ lists -------------------------------
 
     def categoryContent(self, tid, pg, filter, extend):
+        if str(tid or "") == "verify":
+            cookie = self._get_cookie()
+            status = "已检测到 cf_clearance" if "cf_clearance=" in cookie else "未检测到 cf_clearance"
+            items = [
+                {"vod_id": "verify", "vod_name": "打开 SpankBang 人机验证",
+                 "vod_remarks": "点击打开 WebView", "action": "verify"},
+                {"vod_id": "check", "vod_name": "检查 Cookie 状态",
+                 "vod_remarks": status, "action": "check"},
+            ]
+            return {"list": items, "page": 1, "pagecount": 1,
+                    "limit": len(items), "total": len(items)}
+
         try:
             page = max(1, int(pg or "1"))
         except Exception:
@@ -671,8 +708,26 @@ class Spider(BaseSpider):
 
     # ------------------------------- action ------------------------------
 
-    def action(self, action):
-        return {}
+    def action(self, action, value=""):
+        if action == "verify":
+            return {
+                "web": {
+                    "url": HOST + "/",
+                    "mode": "browser",
+                    "cookie": [{"keys": ["cf_clearance"]}],
+                }
+            }
+
+        if action == "check":
+            try:
+                cookie = self._get_cookie()
+                if "cf_clearance=" in cookie:
+                    return {"msg": "已检测到 cf_clearance；请返回后重新加载 SpankBang 分类"}
+                return {"msg": "未检测到 cf_clearance；请打开人机验证并完成验证"}
+            except Exception as e:
+                return {"msg": "读取 Cookie 失败：" + str(e)}
+
+        return {"msg": "未知操作"}
 
     def destroy(self):
         self._cache = {}
