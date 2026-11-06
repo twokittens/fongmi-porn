@@ -132,16 +132,20 @@ class Spider(BaseSpider):
         getter = getattr(self.net, "getCookie", None)
         if not callable(getter):
             return ""
-        value = ""
-        try:
-            value = getter(HOST)
-        except TypeError:
+        value = None
+        for cookie_url in (HOST + "/", HOST):
             try:
-                value = getter()
+                value = getter(cookie_url)
+                if value:
+                    break
+            except TypeError:
+                try:
+                    value = getter()
+                    break
+                except Exception:
+                    continue
             except Exception:
-                value = ""
-        except Exception:
-            value = ""
+                continue
 
         if isinstance(value, dict):
             # 有些实现返回 {name: value}，有些返回 {cookie: "..."}。
@@ -259,8 +263,27 @@ class Spider(BaseSpider):
     def _video_items(self, root, exclude_playlist=False):
         result = []
         seen = set()
-        for node in root.find_all(lambda n: n.attr("data-testid") == "video-item" or
-                                  (n.has_class("js-video-item") and n.attr("data-id"))):
+        nodes = root.find_all(lambda n: n.attr("data-testid") == "video-item" or
+                              (n.has_class("js-video-item") and n.attr("data-id")))
+        known_nodes = set(id(node) for node in nodes)
+        for anchor in root.find_all(lambda n: n.tag == "a" and
+                                    "/video/" in n.attr("href")):
+            candidate = anchor
+            parent = anchor.parent
+            for _ in range(4):
+                if parent is None:
+                    break
+                classes = " ".join(parent.classes()).lower()
+                if (re.search(r"(?:video|thumb|item|card)", classes) or
+                        parent.attr("data-testid") or parent.attr("data-id")):
+                    candidate = parent
+                    break
+                parent = parent.parent
+            if id(candidate) not in known_nodes:
+                nodes.append(candidate)
+                known_nodes.add(id(candidate))
+
+        for node in nodes:
             if exclude_playlist:
                 parent = node.parent
                 inside_playlist = False
@@ -272,7 +295,8 @@ class Spider(BaseSpider):
                 if inside_playlist:
                     continue
             vid = node.attr("data-id")
-            anchors = node.find_all(lambda n: n.tag == "a" and n.attr("href"))
+            anchors = ([node] if node.tag == "a" else []) + node.find_all(
+                lambda n: n.tag == "a" and n.attr("href"))
             href = ""
             for a in anchors:
                 h = a.attr("href")
@@ -284,15 +308,18 @@ class Spider(BaseSpider):
             if not href:
                 continue
 
-            title = ""
+            title = node.attr("title") or node.attr("data-title")
             # The thumbnail anchor usually contains only the HD/duration badge.
             # Prefer a title-bearing text anchor, then the thumbnail's alt text.
-            for a in anchors:
-                if a.attr("title"):
-                    title = a.attr("title")
-                    break
             if not title:
-                for img in node.find_all(lambda n: n.tag == "img"):
+                for a in anchors:
+                    if a.attr("title"):
+                        title = a.attr("title")
+                        break
+            if not title:
+                images = ([node] if node.tag == "img" else []) + node.find_all(
+                    lambda n: n.tag == "img")
+                for img in images:
                     title = img.attr("alt")
                     if title:
                         break
@@ -312,7 +339,9 @@ class Spider(BaseSpider):
                 continue
 
             pic = ""
-            for img in node.find_all(lambda n: n.tag == "img"):
+            images = ([node] if node.tag == "img" else []) + node.find_all(
+                lambda n: n.tag == "img")
+            for img in images:
                 pic = img.attr("data-src") or img.attr("src") or img.attr("data-original")
                 if pic and "blank.png" not in pic:
                     break
@@ -353,6 +382,24 @@ class Spider(BaseSpider):
             "vod_remarks": item.get("remarks") or "",
             "ratio": 1.78,
         }
+
+    def _error_card(self, error):
+        return {
+            "vod_id": "sb-error",
+            "vod_name": "SpankBang 加载失败",
+            "vod_pic": "",
+            "vod_remarks": _clean(error)[:180],
+        }
+
+    def _empty_page_card(self, root):
+        titles = root.find_all(lambda n: n.tag == "title")
+        title = _clean(titles[0].text()) if titles else "无页面标题"
+        video_links = len(root.find_all(
+            lambda n: n.tag == "a" and "/video/" in n.attr("href")))
+        return self._error_card(
+            "页面已加载但未识别到视频卡片；标题=%s；视频链接=%d"
+            % (title, video_links)
+        )
 
     def _list_page(self, url):
         source = self._request(url)
@@ -413,8 +460,8 @@ class Spider(BaseSpider):
         try:
             root, items, pagecount = self._list_page(HOST + "/")
             return {"list": [self._card(x) for x in items]}
-        except Exception:
-            return {"list": []}
+        except Exception as e:
+            return {"list": [self._error_card(e)]}
 
     # ------------------------------ lists -------------------------------
 
@@ -434,13 +481,23 @@ class Spider(BaseSpider):
             if page > 1:
                 page_url = self._page_url(base, page, root)
                 root, items, pagecount = self._list_page(page_url)
+            if not items:
+                return {
+                    "list": [self._empty_page_card(root)],
+                    "page": page,
+                    "pagecount": pagecount,
+                }
             return {
                 "list": [self._card(x) for x in items],
                 "page": page,
                 "pagecount": pagecount,
             }
-        except Exception:
-            return {"list": [], "page": page, "pagecount": 0}
+        except Exception as e:
+            return {
+                "list": [self._error_card(e)],
+                "page": page,
+                "pagecount": 0,
+            }
 
     def searchContent(self, key, quick, pg="1"):
         keyword = _clean(key)
@@ -459,8 +516,12 @@ class Spider(BaseSpider):
                 "page": page,
                 "pagecount": pagecount,
             }
-        except Exception:
-            return {"list": [], "page": page, "pagecount": 0}
+        except Exception as e:
+            return {
+                "list": [self._error_card(e)],
+                "page": page,
+                "pagecount": 0,
+            }
 
     # ------------------------------ detail ------------------------------
 
