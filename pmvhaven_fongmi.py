@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 import re
 import json
@@ -382,7 +381,6 @@ class Spider(BaseSpider):
             result["error"] = self.last_error
 
         return result
-
     # ========================================
     # 首页
     # ========================================
@@ -463,7 +461,6 @@ class Spider(BaseSpider):
             "/api/videos", params, page, limit
         )
 
-
     def _playlist_videos(self, playlist_id, page):
         """读取播放列表 API；接口每页 50 条，供 FongMi 下滑分页。"""
         playlist_id = str(playlist_id or "").strip()
@@ -487,6 +484,109 @@ class Spider(BaseSpider):
             limit
         )
 
+    def _playlist_all_videos(self, playlist_id):
+        """读取播放列表全部 API 分页，保留每集真实 videoUrl。"""
+        playlist_id = str(playlist_id or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{24}", playlist_id):
+            return []
+
+        limit = 50
+        all_videos = []
+        total_pages = 1
+        for page in range(1, 201):
+            params = {"page": page, "limit": limit}
+            url = (
+                HOST + "/api/playlists/"
+                + U.quote(playlist_id, safe="")
+                + "?" + U.urlencode(params)
+            )
+            data = self._request_json(url)
+            if not data:
+                break
+
+            pagination = data.get("pagination") or {}
+            if not isinstance(pagination, dict):
+                pagination = {}
+            try:
+                total_pages = max(1, int(pagination.get("totalPages") or total_pages))
+            except (ValueError, TypeError):
+                pass
+
+            body = data.get("data") or {}
+            raw_videos = []
+            if isinstance(body, dict):
+                raw_videos = body.get("videoDetails") or []
+                # 某些接口版本可能直接返回视频对象数组。
+                if not isinstance(raw_videos, list):
+                    raw_videos = body.get("videos") or []
+            if not isinstance(raw_videos, list) or not raw_videos:
+                break
+
+            all_videos.extend(raw_videos)
+            has_more = pagination.get("hasMore")
+            if has_more is False or str(has_more).lower() == "false":
+                break
+            if page >= total_pages:
+                break
+
+        unique = []
+        seen = set()
+        for raw in all_videos:
+            info = self._video_info(raw)
+            if not info:
+                continue
+            vid = info.get("_id")
+            if not vid or vid in seen:
+                continue
+            seen.add(vid)
+            if not self._valid_mp4(self._normalize_video_url(info.get("videoUrl"))):
+                fetched = self._fetch_video(vid)
+                if fetched:
+                    info.update(fetched)
+            if self._valid_mp4(self._normalize_video_url(info.get("videoUrl"))):
+                self.video_cache[vid] = info
+                unique.append(info)
+        return unique
+
+    def _playlist_detail(self, playlist_id, playlist_name=""):
+        """将播放列表直接构造成 FongMi 播放详情页和完整选集。"""
+        playlist_id = str(playlist_id or "").strip()
+        playlist_name = clean_text(playlist_name) or "播放列表"
+
+        if playlist_name == "播放列表":
+            for entries in getattr(self, "playlist_cache", {}).values():
+                for entry in entries:
+                    if entry.get("id") == playlist_id:
+                        playlist_name = entry.get("name") or playlist_name
+                        break
+
+        videos = self._playlist_all_videos(playlist_id)
+        if not videos:
+            return {"list": [{
+                "vod_id": "playlistplay:" + playlist_id,
+                "vod_name": playlist_name,
+                "vod_content": "无法获取播放列表视频，请稍后重试。",
+                "vod_play_from": "",
+                "vod_play_url": "",
+            }]}
+
+        episodes = []
+        for index, info in enumerate(videos, 1):
+            title = clean_text(info.get("title")) or "第{}集".format(index)
+            play_id = "pmv:" + encode_data(info)
+            episodes.append("{}${}".format(title, play_id))
+
+        first = videos[0]
+        return {"list": [{
+            "vod_id": "playlistplay:" + playlist_id,
+            "vod_name": playlist_name,
+            "vod_pic": first.get("thumbnailUrl", ""),
+            "vod_actor": "PMVHaven",
+            "vod_content": "播放列表共 {} 集，已加载全部选集。".format(len(episodes)),
+            "vod_play_from": playlist_name,
+            "vod_play_url": "#".join(episodes),
+        }]}
+
     def _fetch_video_playlists(self, video_id):
         """从视频页的 Playlists with this video 区域提取播放列表。"""
         video_id = str(video_id or "").strip()
@@ -499,7 +599,6 @@ class Spider(BaseSpider):
         if video_id in self.playlist_cache:
             return self.playlist_cache[video_id]
 
-        # 视频页的 og:url 使用 /videos/{视频ID} 路由。
         page_html = self._request(
             HOST + "/videos/" + U.quote(video_id, safe=""),
             accept="text/html,application/xhtml+xml,*/*",
@@ -515,7 +614,6 @@ class Spider(BaseSpider):
             )
             if heading:
                 section = page_html[heading.end():]
-                # 仅解析该标题下面的播放列表卡片，避免误抓导航链接。
                 next_heading = re.search(r"<h[1-3]\b", section, re.I)
                 if next_heading:
                     section = section[:next_heading.start()]
@@ -609,9 +707,7 @@ class Spider(BaseSpider):
             params,
             page,
             limit
-        )
-
-    # ========================================
+        )    # ========================================
     # 视频 ID
     # ========================================
 
@@ -634,7 +730,7 @@ class Spider(BaseSpider):
     # 作者、标签点击链接
     # ========================================
 
-    def _entity_link(self, name, target):
+    def _entity_link(self, name, target, type_flag=1):
         name = clean_text(name)
 
         if not name:
@@ -643,7 +739,7 @@ class Spider(BaseSpider):
         payload = {
             "id": target,
             "name": name,
-            "type_flag": 1,
+            "type_flag": type_flag,
         }
 
         try:
@@ -673,7 +769,7 @@ class Spider(BaseSpider):
         vid = str(vid or "").strip()
         if not re.fullmatch(r"[0-9a-fA-F]{24}", vid):
             return {}
-        # 不同站点部署可能采用不同详情路由，逐个验证返回数据。
+
         for path in ("/api/videos/", "/api/video/"):
             data = self._request_json(HOST + path + U.quote(vid, safe=""))
             video = self._extract_video(data)
@@ -691,11 +787,15 @@ class Spider(BaseSpider):
             vid = str(vod_id)
         if not vid:
             return info
-        # 搜索接口的 videoUrl 可能缺失，必须尝试详情接口补全。
+
         if not self._valid_mp4(info.get("videoUrl")):
             fetched = self._fetch_video(vid)
             if fetched:
-                info = dict(info, **{k: v for k, v in fetched.items() if v not in (None, "", [], {})})
+                info = dict(info, **{
+                    k: v for k, v in fetched.items()
+                    if v not in (None, "", [], {})
+                })
+
         if info:
             if not hasattr(self, "video_cache"):
                 self.video_cache = {}
@@ -708,7 +808,10 @@ class Spider(BaseSpider):
             url = "https:" + url
         elif url.startswith("/"):
             url = U.urljoin(HOST, url)
-        return url.startswith(("https://", "http://")) and bool(U.urlsplit(url).netloc)
+        return (
+            url.startswith(("https://", "http://"))
+            and bool(U.urlsplit(url).netloc)
+        )
 
     def _normalize_video_url(self, url):
         url = str(url or "").strip()
@@ -739,6 +842,13 @@ class Spider(BaseSpider):
             if isinstance(ids, (list, tuple))
             else ids
         )
+
+        vod_id = str(vod_id or "")
+        if vod_id.startswith("playlistplay:"):
+            parts = vod_id.split(":", 2)
+            playlist_id = parts[1] if len(parts) > 1 else ""
+            playlist_name = U.unquote(parts[2]) if len(parts) > 2 else ""
+            return self._playlist_detail(playlist_id, playlist_name)
 
         info = self._resolve_info(vod_id)
 
@@ -804,7 +914,7 @@ class Spider(BaseSpider):
                     "标签：" + "、".join(tag_links)
                 )
 
-        # 播放列表入口：点击后进入该列表的视频集合，支持下滑分页。
+        # 播放列表入口：点击后直接进入该播放列表的选集播放页。
         playlists = self._fetch_video_playlists(info.get("_id", ""))
         if playlists:
             playlist_links = []
@@ -816,7 +926,8 @@ class Spider(BaseSpider):
                 playlist_links.append(
                     self._entity_link(
                         playlist_name,
-                        "playlist:" + playlist_id
+                        "playlistplay:" + playlist_id + ":" + U.quote(playlist_name, safe=""),
+                        0
                     )
                 )
             if playlist_links:
@@ -863,9 +974,7 @@ class Spider(BaseSpider):
                 "发布日期：" + date[:10]
             )
 
-        play_from, play_url = self._build_play_sources(
-            info
-        )
+        play_from, play_url = self._build_play_sources(info)
 
         vod = {
             "vod_id": vod_id,
