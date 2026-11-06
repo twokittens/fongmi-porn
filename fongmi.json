@@ -103,7 +103,7 @@
       "changeable": 0
     },
     {
-      "key": "spankbang_v2",
+      "key": "spankbang_v7",
       "name": "SpankBang11",
       "type": 3,
       "api": "./spankbang_fongmi.py",
