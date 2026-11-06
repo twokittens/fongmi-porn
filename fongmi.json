@@ -104,7 +104,7 @@
     },
     {
       "key": "spankbang_v2",
-      "name": "SpankBang",
+      "name": "SpankBang11",
       "type": 3,
       "api": "./spankbang_fongmi.py",
       "searchable": 1,
