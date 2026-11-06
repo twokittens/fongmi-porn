@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import re
 import json
+import html
 import time
 import base64
 import urllib.parse as U
@@ -118,6 +119,7 @@ class Spider(BaseSpider):
 
     def init(self, extend=""):
         self.video_cache = {}
+        self.playlist_cache = {}
         self.last_error = ""
 
     def destroy(self):
@@ -283,16 +285,28 @@ class Spider(BaseSpider):
     # ========================================
 
     def _parse_list(self, data, page, limit):
-        videos = data.get("videos") or data.get("results") or data.get("items")
+        videos = (
+            data.get("videoDetails")
+            or data.get("videos")
+            or data.get("results")
+            or data.get("items")
+        )
         pagination = data.get("pagination") or {}
 
         if not isinstance(videos, list):
             nested = data.get("data")
 
             if isinstance(nested, dict):
-                videos = nested.get("videos") or nested.get("results") or nested.get("items")
+                videos = (
+                    nested.get("videoDetails")
+                    or nested.get("videos")
+                    or nested.get("results")
+                    or nested.get("items")
+                )
                 pagination = (
-                    nested.get("pagination") or pagination
+                    data.get("pagination")
+                    or nested.get("pagination")
+                    or pagination
                 )
 
         if not isinstance(videos, list):
@@ -320,6 +334,8 @@ class Spider(BaseSpider):
                 items.append(card)
 
         has_next = pagination.get("hasNext")
+        if has_next is None:
+            has_next = pagination.get("hasMore")
 
         try:
             total_pages = int(
@@ -447,6 +463,98 @@ class Spider(BaseSpider):
             "/api/videos", params, page, limit
         )
 
+
+    def _playlist_videos(self, playlist_id, page):
+        """读取播放列表 API；接口每页 50 条，供 FongMi 下滑分页。"""
+        playlist_id = str(playlist_id or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{24}", playlist_id):
+            return {
+                "list": [],
+                "page": page,
+                "pagecount": page,
+                "limit": 50,
+            }
+
+        limit = 50
+        params = {
+            "page": page,
+            "limit": limit,
+        }
+        return self._api_list(
+            "/api/playlists/" + U.quote(playlist_id, safe=""),
+            params,
+            page,
+            limit
+        )
+
+    def _fetch_video_playlists(self, video_id):
+        """从视频页的 Playlists with this video 区域提取播放列表。"""
+        video_id = str(video_id or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{24}", video_id):
+            return []
+
+        if not hasattr(self, "playlist_cache"):
+            self.playlist_cache = {}
+
+        if video_id in self.playlist_cache:
+            return self.playlist_cache[video_id]
+
+        # 视频页的 og:url 使用 /videos/{视频ID} 路由。
+        page_html = self._request(
+            HOST + "/videos/" + U.quote(video_id, safe=""),
+            accept="text/html,application/xhtml+xml,*/*",
+            timeout=25
+        )
+
+        result = []
+        if page_html:
+            heading = re.search(
+                r"Playlists\s+with\s+this\s+video",
+                page_html,
+                re.I
+            )
+            if heading:
+                section = page_html[heading.end():]
+                # 仅解析该标题下面的播放列表卡片，避免误抓导航链接。
+                next_heading = re.search(r"<h[1-3]\b", section, re.I)
+                if next_heading:
+                    section = section[:next_heading.start()]
+
+                seen = set()
+                for match in re.finditer(
+                    r'<a\s+href="/playlists/([0-9a-fA-F]{24})"[^>]*>(.*?)</a>',
+                    section,
+                    re.I | re.S
+                ):
+                    playlist_id = match.group(1)
+                    if playlist_id in seen:
+                        continue
+
+                    card_html = match.group(2)
+                    title_match = re.search(
+                        r"<h[1-6][^>]*>(.*?)</h[1-6]>",
+                        card_html,
+                        re.I | re.S
+                    )
+                    if title_match:
+                        name = re.sub(
+                            r"<[^>]+>", " ",
+                            title_match.group(1)
+                        )
+                        name = clean_text(html.unescape(name))
+                    else:
+                        name = "播放列表"
+
+                    if name:
+                        seen.add(playlist_id)
+                        result.append({
+                            "id": playlist_id,
+                            "name": name,
+                        })
+
+        self.playlist_cache[video_id] = result
+        return result
+
     def categoryContent(self, tid, pg, filter, extend):
         page = safe_page(pg)
         tid = str(tid or "all")
@@ -458,6 +566,10 @@ class Spider(BaseSpider):
         if tid.startswith("tag:"):
             tag = U.unquote(tid.split(":", 1)[1])
             return self._tag_videos(tag, page)
+
+        if tid.startswith("playlist:"):
+            playlist_id = tid.split(":", 1)[1]
+            return self._playlist_videos(playlist_id, page)
 
         aliases = {
             "/browse": "all",
@@ -690,6 +802,26 @@ class Spider(BaseSpider):
             if tag_links:
                 content.append(
                     "标签：" + "、".join(tag_links)
+                )
+
+        # 播放列表入口：点击后进入该列表的视频集合，支持下滑分页。
+        playlists = self._fetch_video_playlists(info.get("_id", ""))
+        if playlists:
+            playlist_links = []
+            for playlist in playlists:
+                playlist_id = playlist.get("id", "")
+                playlist_name = playlist.get("name") or "播放列表"
+                if not playlist_id:
+                    continue
+                playlist_links.append(
+                    self._entity_link(
+                        playlist_name,
+                        "playlist:" + playlist_id
+                    )
+                )
+            if playlist_links:
+                content.append(
+                    "播放列表：" + "、".join(playlist_links)
                 )
 
         if stars:
