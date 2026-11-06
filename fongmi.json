@@ -103,32 +103,10 @@
       "changeable": 0
     },
     {
-      "key": "spankbang_v7",
-      "name": "SpankBang11",
-      "type": 3,
-      "api": "./spankbang_fongmi.py",
-      "searchable": 1,
-      "quickSearch": 1,
-      "filterable": 0,
-      "changeable": 1
-    },
-    {
       "key": "missav_verify",
       "name": "MissAV 人机验证",
       "type": 3,
       "api": "./missav_verify.py",
-      "searchable": 0,
-      "quickSearch": 0,
-      "filterable": 0,
-      "changeable": 0,
-      "hide": 0,
-      "ext": {}
-    },
-    {
-      "key": "spankbang_verify",
-      "name": "Spankbang 人机验证",
-      "type": 3,
-      "api": "./spankbang_verify.py",
       "searchable": 0,
       "quickSearch": 0,
       "filterable": 0,
