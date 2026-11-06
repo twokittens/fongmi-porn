@@ -93,7 +93,7 @@
       "changeable": 0
     },
     {
-      "key": "pmvhaven_python",
+      "key": "pmvhaven_pythonv1",
       "name": "PMVHaven",
       "type": 3,
       "api": "./pmvhaven_fongmi.py",
